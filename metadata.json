@@ -1,0 +1,6 @@
+{
+  "name": "churchOs",
+  "description": "Multi-tenant SaaS for churches with MoMo giving and admin dashboard.",
+  "requestFramePermissions": ["camera", "microphone", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

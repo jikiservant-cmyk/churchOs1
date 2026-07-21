@@ -1,0 +1,14 @@
+node_modules/
+.next/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Debug / build artifacts — do not commit
+grep_output.txt
+imports.txt
+tsconfig.tsbuildinfo
+check-wallet.js
+test-connection.ts
