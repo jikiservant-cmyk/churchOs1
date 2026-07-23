@@ -39,16 +39,12 @@ export async function login(prevState: AuthState, formData: FormData): Promise<A
     let profile = null;
     let profileError = null;
 
-    console.log(`[Auth] Looking for admin profile for user: ${authData.user.id} (${email})`);
-
     // Attempt 1: Fetch by ID
     const { data: idData, error: idError } = await supabase
       .from('admin_profiles')
       .select('role, tenant_id, email, app_type')
       .eq('id', authData.user.id)
       .maybeSingle();
-    
-    console.log(`[Auth] Attempt 1 (by ID): data=`, idData, `error=`, idError);
     
     if (idData) {
       profile = idData;
@@ -63,8 +59,6 @@ export async function login(prevState: AuthState, formData: FormData): Promise<A
         .select('role, tenant_id, email, app_type')
         .eq('email', email)
         .maybeSingle();
-      
-      console.log(`[Auth] Attempt 2 (by Email): data=`, emailData, `error=`, emailError);
       
       if (emailData) {
         profile = emailData;
@@ -90,29 +84,23 @@ export async function login(prevState: AuthState, formData: FormData): Promise<A
     const tenantId = profile.tenant_id;
     const appType = profile.app_type;
     
-    console.log(`[Auth] Profile found! role=${profile.role}, tenant_id=${tenantId}, app_type=${appType}, initial targetSlug=${targetSlug}`);
-    
     if (tenantId) {
       if (appType === 'church' || (!appType && profile.role === 'pastor')) {
         // Use Admin Client to query church schema, bypassing RLS!
         const adminSupabase = await createAdminClient();
-        const { data: church, error: churchError } = await adminSupabase
+        const { data: church } = await adminSupabase
           .schema('church')
           .from('churches')
           .select('slug')
           .eq('id', tenantId)
           .maybeSingle();
         
-        console.log(`[Auth] Church lookup (Admin Client): id=${tenantId}, data=`, church, `error=`, churchError);
-        
         if (church?.slug) {
           targetSlug = church.slug;
-          console.log(`[Auth] Updated targetSlug to ${targetSlug}`);
         }
       }
     }
 
-    console.log(`[Auth] User authorized. Redirecting to /${targetSlug}/admin`);
     redirect(`/${targetSlug}/admin`);
   } catch (err: any) {
     if (err.message === 'NEXT_REDIRECT' || err.__next_redirect) throw err;

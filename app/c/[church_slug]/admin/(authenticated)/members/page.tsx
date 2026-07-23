@@ -25,9 +25,6 @@ export default async function MembersPage(props: {
     .eq('slug', resolvedParams.church_slug)
     .maybeSingle();
 
-  console.log('[Members Page] Slug from URL:', resolvedParams.church_slug);
-  console.log('[Members Page] Church Data:', church, 'Church Error:', churchError);
-
   // Fetch members. 
   let query = supabase
     .schema('church')
@@ -42,8 +39,6 @@ export default async function MembersPage(props: {
   const { data: members, error } = await query
     .order('created_at', { ascending: false })
     .limit(200);
-
-  console.log('[Members Page] Members Data:', members, 'Members Error:', error);
 
   return (
     <div className="max-w-7xl mx-auto space-y-6">

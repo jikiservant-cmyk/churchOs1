@@ -25,10 +25,10 @@ export async function initiateNajikiPayment(formData: FormData) {
     const amount = parseInt(amountStr, 10);
     const phoneNumber = formData.get('phoneNumber') as string;
 
-    console.log('[Najiki] Initiation started:', { churchId, amount, phoneNumber });
+    console.log('[Najiki] Initiation started');
 
     if (!churchId || !phoneNumber || isNaN(amount)) {
-      console.error('[Najiki] Missing or invalid fields:', { churchId, phoneNumber, amount });
+      console.error('[Najiki] Missing or invalid required fields for payment');
       return { error: 'Missing or invalid required fields' };
     }
 

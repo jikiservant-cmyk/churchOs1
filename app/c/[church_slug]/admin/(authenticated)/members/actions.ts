@@ -89,9 +89,6 @@ export async function addMember(formData: FormData) {
           status: 'active'
         };
 
-        console.log('--- INSERTING NEW MEMBER ---', payload);
-        console.log('User Role/Metadata payload:', user?.user_metadata);
-
         const { error } = await supabase
           .schema('church')
           .from('members')

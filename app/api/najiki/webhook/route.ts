@@ -137,7 +137,7 @@ export async function POST(request: Request) {
         }
 
         revalidatePath('/', 'layout');
-        console.log('[Najiki Webhook] ✅ Success! Wallet credited. Tenant:', resolvedTenantId || tx.tenant_id, 'Amount:', amount);
+        console.log('[Najiki Webhook] ✅ Success! Wallet credited. Amount:', amount);
         return NextResponse.json({ received: true });
 
       } catch (fallbackErr) {

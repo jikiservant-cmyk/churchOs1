@@ -29,11 +29,9 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
       .maybeSingle();
 
     if (!church) {
-      console.error('[validateUsherPasskey] No church found for slug:', churchSlug);
+      console.error('[validateUsherPasskey] No church found for slug.');
       return { success: false, error: 'Church not found.' };
     }
-
-    console.log('[validateUsherPasskey] Found church:', church.name, 'Expected Passkey:', church.passkey);
 
     if (church.passkey?.toUpperCase() !== passkey.toUpperCase()) {
       return { success: false, error: 'Invalid passkey. Please check and try again.' };
@@ -114,8 +112,6 @@ export async function createEvent(formData: FormData, churchId: string, churchSl
   const eventDate = formData.get('event_date') as string;
   const startTime = formData.get('start_time') as string;
   const location = formData.get('location') as string;
-
-  console.log('Creating event for church:', churchId, 'by user:', user.id);
 
   const { error } = await supabase
     .schema('church')
@@ -329,7 +325,6 @@ async function checkAuthorization(churchSlug: string, eventId: string) {
 
 export async function markAttendance(churchSlug: string, eventId: string, memberId: string, status: 'present' | 'late' | 'absent' | 'excused' = 'present') {
   try {
-    console.log(`[markAttendance] Marking ${memberId} as ${status} for event ${eventId} (Slug: ${churchSlug})`);
     const { adminClient: supabase } = await checkAuthorization(churchSlug, eventId);
     
     // 1. Get the church_id from the event first
@@ -655,7 +650,7 @@ export async function sendMissedYouMessages(churchId: string, churchSlug: string
           }
         }
       } catch (err) {
-        console.error(`Failed to send SMS to ${member.phone_number}:`, err);
+        console.error('Failed to send SMS to recipient:', err);
       }
       
       // Small delay to avoid hitting AT rate limits

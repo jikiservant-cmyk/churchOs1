@@ -8,7 +8,7 @@ export async function POST(req: Request) {
     const body = await req.json();
     const { phoneNumber, message, churchId } = body;
 
-    console.log(`[SMS API] Request received for phone: ${phoneNumber}, churchId: ${churchId}`);
+    console.log('[SMS API] Request received');
 
     // 1. Authenticate User & Enforce Multi-Tenancy
     const supabaseUserClient = await createSupabaseServerClient();
