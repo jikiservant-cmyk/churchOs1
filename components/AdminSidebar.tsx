@@ -4,7 +4,7 @@ import { useState } from 'react';
 import Link from 'next/link';
 import Image from 'next/image';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Users, UserPlus, MessageSquare, ClipboardList, Settings, LogOut, Menu, X } from 'lucide-react';
+import { LayoutDashboard, Users, UserPlus, MessageSquare, ClipboardList, Settings, LogOut, Menu, X, UserCheck } from 'lucide-react';
 import type { Church } from '@/lib/db';
 
 export default function AdminSidebar({ church, churchSlug }: { church: Church, churchSlug: string }) {
@@ -16,6 +16,7 @@ export default function AdminSidebar({ church, churchSlug }: { church: Church, c
   const navLinks = [
     { href: `/${churchSlug}/admin`, icon: LayoutDashboard, label: 'Dashboard' },
     { href: `/${churchSlug}/admin/members`, icon: Users, label: 'Members' },
+    { href: `/${churchSlug}/admin/visitors`, icon: UserCheck, label: 'Visitors' },
     { href: `/${churchSlug}/admin/attendance`, icon: ClipboardList, label: 'Attendance' },
     { href: `/${churchSlug}/admin/new-converts`, icon: UserPlus, label: 'New Converts' },
     { href: `/${churchSlug}/admin/messages`, icon: MessageSquare, label: 'Messages' },
@@ -44,12 +45,12 @@ export default function AdminSidebar({ church, churchSlug }: { church: Church, c
       <aside 
         style={{ fontFamily: "'Outfit', sans-serif" }}
         className={`
-          fixed md:static inset-y-0 left-0 z-50 w-64 bg-[#2B1A0E] flex flex-col
-          transition-transform duration-300 ease-in-out px-4 py-7
+          fixed md:sticky md:top-0 inset-y-0 left-0 z-50 w-64 h-screen shrink-0 bg-[#2B1A0E] flex flex-col
+          transition-transform duration-300 ease-in-out px-4 py-7 overflow-y-auto
           ${isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}
         `}
       >
-        <div className="mb-8 px-2 flex items-center justify-between">
+        <div className="mb-8 px-2 flex items-center justify-between shrink-0">
           <div className="flex flex-col">
             <h2 style={{ fontFamily: "'Playfair Display', serif" }} className="text-lg font-bold text-[#F5E6CE] leading-tight truncate">
               {church.name}
@@ -64,7 +65,7 @@ export default function AdminSidebar({ church, churchSlug }: { church: Church, c
           </button>
         </div>
 
-        <nav className="flex-1 space-y-1 overflow-y-auto">
+        <nav className="flex-1 space-y-1 overflow-y-auto min-h-0 pr-1">
           {navLinks.map((link) => {
             const isActive = pathname === link.href;
             return (

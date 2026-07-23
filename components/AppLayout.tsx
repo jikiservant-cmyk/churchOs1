@@ -4,9 +4,9 @@ import { Home, Users, CreditCard, MessageSquare, Settings, Bell } from 'lucide-r
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex h-screen bg-gray-50 font-sans">
+    <div className="flex h-screen bg-gray-50 font-sans overflow-hidden">
       {/* Sidebar */}
-      <aside className="w-64 bg-white border-r border-gray-100 flex flex-col">
+      <aside className="w-64 h-full bg-white border-r border-gray-100 flex flex-col overflow-y-auto shrink-0">
         <div className="h-16 flex items-center px-6 border-b border-gray-100">
           <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center mr-3">
             <span className="text-white font-bold font-sans">C</span>

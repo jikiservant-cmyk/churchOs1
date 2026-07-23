@@ -2,7 +2,6 @@
 
 import React, { useState } from 'react';
 import { Send, Plus, MoreVertical, Phone, Search, MessageSquare } from 'lucide-react';
-import TopUpForm from './TopUpForm';
 import TopUpModal from './TopUpModal';
 
 const DUMMY_MESSAGES = [

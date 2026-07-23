@@ -51,9 +51,24 @@ export async function POST(request: Request) {
     console.log('[Najiki Webhook] Parsed payload:', JSON.stringify(payload, null, 2));
 
     // Extract key fields from Najiki payload
-    const { paymentIntentId, reference, status, amount, externalEntityId, providerPaymentId, failureReason } = payload;
+    const { paymentIntentId, reference, status, amount, externalEntityId, providerPaymentId, failureReason, tenantCode } = payload;
 
     const db = getServiceDb();
+
+    // Resolve tenant using tenantCode if available
+    let resolvedTenantId: string | null = null;
+    if (tenantCode) {
+      const { data: tenant, error: tenantError } = await db
+        .from('tenants')
+        .select('id')
+        .eq('code', tenantCode)
+        .maybeSingle();
+
+      if (!tenantError && tenant) {
+        resolvedTenantId = tenant.id;
+        console.log('[Najiki Webhook] Resolved tenant via tenantCode:', tenantCode, '→', tenant.id);
+      }
+    }
 
     // Find transaction by either reference or paymentIntentId (we stored reference = idempotencyKey initially)
     let { data: tx, error: txError } = await db
@@ -79,7 +94,7 @@ export async function POST(request: Request) {
         // Try to use the existing RPC
         const { data: rpcResult, error: rpcErr } = await db.rpc('process_topup_webhook', {
           p_reference: reference,
-          p_tenant_id: tx.tenant_id,
+          p_tenant_id: resolvedTenantId || tx.tenant_id,
           p_amount: amount,
           p_payload: payload
         });
@@ -87,17 +102,17 @@ export async function POST(request: Request) {
         if (rpcErr) {
           console.warn('[Najiki Webhook] process_topup_webhook RPC failed, falling back to manual:', rpcErr);
           // Fallback to manual processing
-          await handleSuccessManually(db, tx, payload);
+          await handleSuccessManually(db, tx, payload, resolvedTenantId);
         } else {
           console.log('[Najiki Webhook] RPC succeeded:', rpcResult);
         }
 
         revalidatePath('/', 'layout');
-        console.log('[Najiki Webhook] ✅ Success! Wallet credited. Tenant:', tx.tenant_id, 'Amount:', amount);
+        console.log('[Najiki Webhook] ✅ Success! Wallet credited. Tenant:', resolvedTenantId || tx.tenant_id, 'Amount:', amount);
         return NextResponse.json({ received: true });
 
       } catch (fallbackErr) {
-        await handleSuccessManually(db, tx, payload);
+        await handleSuccessManually(db, tx, payload, resolvedTenantId);
         revalidatePath('/', 'layout');
         return NextResponse.json({ received: true });
       }
@@ -125,10 +140,10 @@ export async function POST(request: Request) {
   }
 }
 
-async function handleSuccessManually(db: any, tx: any, payload: any) {
+async function handleSuccessManually(db: any, tx: any, payload: any, resolvedTenantId: string | null) {
   // 1. Increment wallet balance
   await db.rpc('increment_wallet_balance', {
-    p_tenant_id: tx.tenant_id,
+    p_tenant_id: resolvedTenantId || tx.tenant_id,
     p_amount: tx.amount
   });
 

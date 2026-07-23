@@ -59,6 +59,7 @@ END $$;
 CREATE TABLE IF NOT EXISTS church.churches (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   name text NOT NULL,
+  code text UNIQUE,
   slug text NOT NULL UNIQUE,
   passkey text DEFAULT '1234', -- 4-6 digit entrance code for ushers
   app_type text DEFAULT 'church', -- Added to match unified app structure
@@ -100,6 +101,7 @@ CREATE TABLE IF NOT EXISTS public.tenants (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   app_type text NOT NULL DEFAULT 'church', 
   name text NOT NULL,
+  code text UNIQUE,
   created_at timestamptz DEFAULT now()
 );
 
@@ -622,6 +624,7 @@ CREATE TABLE IF NOT EXISTS church.members (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) NOT NULL,
   full_name text NOT NULL,
+  code text UNIQUE,
   phone_number text,
   email text,
   gender text,
@@ -640,6 +643,7 @@ CREATE TABLE IF NOT EXISTS church.new_converts (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) NOT NULL,
   name text NOT NULL,
+  code text UNIQUE,
   contact text,
   follow_up_status text DEFAULT 'pending',
   notes text,
@@ -674,6 +678,7 @@ CREATE TABLE IF NOT EXISTS church.events (
   church_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
 
   name text NOT NULL,
+  code text UNIQUE,
   service_type church.event_service_type NOT NULL,
   event_date date NOT NULL DEFAULT CURRENT_DATE,
   start_time time DEFAULT '09:00:00',
@@ -725,6 +730,7 @@ CREATE TABLE IF NOT EXISTS church.prayers (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) NOT NULL,
   submitter_name text NOT NULL,
+  code text UNIQUE,
   body text NOT NULL,
   status text DEFAULT 'open', -- 'open', 'answered'
   created_at timestamptz DEFAULT now()
@@ -734,7 +740,9 @@ CREATE TABLE IF NOT EXISTS church.small_groups (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) NOT NULL,
   name text NOT NULL,
+  code text UNIQUE,
   leader_name text NOT NULL,
+  code text UNIQUE,
   meeting_day text NOT NULL,
   member_count int DEFAULT 0,
   created_at timestamptz DEFAULT now()

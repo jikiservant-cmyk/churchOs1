@@ -39,6 +39,7 @@ export async function login(prevState: AuthState, formData: FormData): Promise<A
     let profile = null;
     let profileError = null;
 
+    console.log(`[Auth] Looking for admin profile for user: ${authData.user.id} (${email})`);
 
     // Attempt 1: Fetch by ID
     const { data: idData, error: idError } = await supabase
@@ -47,6 +48,7 @@ export async function login(prevState: AuthState, formData: FormData): Promise<A
       .eq('id', authData.user.id)
       .maybeSingle();
     
+    console.log(`[Auth] Attempt 1 (by ID): data=`, idData, `error=`, idError);
     
     if (idData) {
       profile = idData;
@@ -62,6 +64,7 @@ export async function login(prevState: AuthState, formData: FormData): Promise<A
         .eq('email', email)
         .maybeSingle();
       
+      console.log(`[Auth] Attempt 2 (by Email): data=`, emailData, `error=`, emailError);
       
       if (emailData) {
         profile = emailData;
@@ -87,6 +90,7 @@ export async function login(prevState: AuthState, formData: FormData): Promise<A
     const tenantId = profile.tenant_id;
     const appType = profile.app_type;
     
+    console.log(`[Auth] Profile found! role=${profile.role}, tenant_id=${tenantId}, app_type=${appType}, initial targetSlug=${targetSlug}`);
     
     if (tenantId) {
       if (appType === 'church' || (!appType && profile.role === 'pastor')) {
@@ -99,13 +103,16 @@ export async function login(prevState: AuthState, formData: FormData): Promise<A
           .eq('id', tenantId)
           .maybeSingle();
         
+        console.log(`[Auth] Church lookup (Admin Client): id=${tenantId}, data=`, church, `error=`, churchError);
         
         if (church?.slug) {
           targetSlug = church.slug;
+          console.log(`[Auth] Updated targetSlug to ${targetSlug}`);
         }
       }
     }
 
+    console.log(`[Auth] User authorized. Redirecting to /${targetSlug}/admin`);
     redirect(`/${targetSlug}/admin`);
   } catch (err: any) {
     if (err.message === 'NEXT_REDIRECT' || err.__next_redirect) throw err;
@@ -128,6 +135,7 @@ export async function signup(prevState: AuthState, formData: FormData): Promise<
 
   try {
     const supabase = await createClient();
+    console.log('[Auth] Attempting signup for:', email);
     
     const { data, error } = await supabase.auth.signUp({
       email,
@@ -146,6 +154,7 @@ export async function signup(prevState: AuthState, formData: FormData): Promise<
       return { error: 'Account creation failed. Please try again.' };
     }
 
+    console.log('[Auth] Signup success for:', email);
     return { success: true, redirectTo: '/signup/provision' };
   } catch (err: any) {
     if (err.message === 'NEXT_REDIRECT' || err.__next_redirect) throw err;

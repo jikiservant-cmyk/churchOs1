@@ -12,3 +12,5 @@ imports.txt
 tsconfig.tsbuildinfo
 check-wallet.js
 test-connection.ts
+.trae/
+fetched-repo/

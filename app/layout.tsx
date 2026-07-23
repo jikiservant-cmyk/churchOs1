@@ -1,7 +1,7 @@
 import type {Metadata} from 'next';
 import { Outfit, Playfair_Display } from 'next/font/google';
 import './globals.css';
-import GlobalClientWrapper from '@/components/GlobalClientWrapper';
+import GlobalClientWrapper from "@/components/GlobalClientWrapper";
 
 const outfit = Outfit({
   subsets: ['latin'],

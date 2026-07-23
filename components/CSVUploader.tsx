@@ -7,7 +7,7 @@ import { useRouter } from 'next/navigation';
 
 interface CSVUploaderProps {
   churchSlug: string;
-  type: 'members' | 'new-converts';
+  type: 'members' | 'new-converts' | 'visitors';
   onUpload: (slug: string, data: any[]) => Promise<{ success?: boolean; error?: string }>;
 }
 
@@ -90,13 +90,15 @@ export default function CSVUploader({ churchSlug, type, onUpload }: CSVUploaderP
         className={`flex items-center justify-center gap-2 px-4 py-2 text-sm font-bold rounded-xl transition-colors disabled:opacity-50 ${
           type === 'members'
             ? 'bg-[rgba(90,55,20,0.05)] text-[#1E1208] hover:bg-[rgba(90,55,20,0.1)]'
+            : type === 'visitors'
+            ? 'bg-teal-50 text-teal-700 hover:bg-teal-100'
             : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
         }`}
       >
         {loading ? (
-          <Loader2 className={`w-4 h-4 animate-spin ${type === 'members' ? 'text-[#9A7E65]' : 'text-slate-400'}`} />
+          <Loader2 className={`w-4 h-4 animate-spin ${type === 'members' ? 'text-[#9A7E65]' : type === 'visitors' ? 'text-teal-500' : 'text-slate-400'}`} />
         ) : (
-          <FileUp className={`w-4 h-4 ${type === 'members' ? 'text-[#9A7E65]' : 'text-slate-500'}`} />
+          <FileUp className={`w-4 h-4 ${type === 'members' ? 'text-[#9A7E65]' : type === 'visitors' ? 'text-teal-600' : 'text-slate-500'}`} />
         )}
         {loading ? 'Uploading...' : 'Import CSV'}
       </button>
@@ -105,6 +107,8 @@ export default function CSVUploader({ churchSlug, type, onUpload }: CSVUploaderP
         <div className={`absolute top-4 right-4 max-w-sm mt-16 p-3 text-xs rounded-xl font-bold border flex items-start gap-2 shadow-lg z-50 animate-in fade-in slide-in-from-top-2 ${
           type === 'members'
             ? 'bg-red-50 text-[#B5622A] border-[rgba(181,98,42,0.1)]'
+            : type === 'visitors'
+            ? 'bg-red-50 text-red-700 border-red-200'
             : 'bg-red-50 text-[#FF4747] border-red-100'
         }`}>
           <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
@@ -116,9 +120,11 @@ export default function CSVUploader({ churchSlug, type, onUpload }: CSVUploaderP
         <div className={`absolute top-4 right-4 max-w-sm mt-16 p-3 text-xs rounded-xl font-bold border flex items-start gap-2 shadow-lg z-50 animate-in fade-in slide-in-from-top-2 ${
           type === 'members'
             ? 'bg-[#F0E6D3] text-[#1E1208] border-[rgba(90,55,20,0.13)]'
+            : type === 'visitors'
+            ? 'bg-teal-50 text-teal-900 border-teal-200'
             : 'bg-white text-slate-900 border-slate-200'
         }`}>
-          <CheckCircle2 className={`w-4 h-4 shrink-0 mt-0.5 ${type === 'members' ? 'text-[#B5622A]' : 'text-cyan-600'}`} />
+          <CheckCircle2 className={`w-4 h-4 shrink-0 mt-0.5 ${type === 'members' ? 'text-[#B5622A]' : type === 'visitors' ? 'text-teal-600' : 'text-cyan-600'}`} />
           <p>{success}</p>
         </div>
       )}

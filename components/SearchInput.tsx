@@ -9,12 +9,12 @@ export default function SearchInput({ placeholder = 'Search...' }: { placeholder
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const [isPending, startTransition] = useTransition();
-  const [query, setQuery] = useState(searchParams.get('q') || '');
+  const [query, setQuery] = useState(searchParams?.get('q') || '');
 
   useEffect(() => {
     const delayDebounceFn = setTimeout(() => {
       startTransition(() => {
-        const params = new URLSearchParams(searchParams);
+        const params = new URLSearchParams(searchParams?.toString() || '');
         if (query) {
           params.set('q', query);
         } else {
