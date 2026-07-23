@@ -50,10 +50,33 @@ export async function POST(request: Request) {
 
     console.log('[Najiki Webhook] Parsed payload:', JSON.stringify(payload, null, 2));
 
-    // Extract key fields from Najiki payload
-    const { paymentIntentId, reference, status, amount, externalEntityId, providerPaymentId, failureReason, tenantCode } = payload;
-
     const db = getServiceDb();
+
+    // Handle SMS Delivery Updates from Najiki
+    if (payload.eventType === 'SMS_DELIVERY_UPDATE') {
+      const { smsId, reference: smsRef, status: smsStatus, providerId } = payload;
+      console.log(`[Najiki Webhook] SMS Delivery Update for ${smsRef || smsId}: ${smsStatus}`);
+
+      if (smsRef || smsId) {
+        const updateObj = {
+          status: smsStatus?.toUpperCase() === 'DELIVERED' ? 'DELIVERED' : smsStatus?.toUpperCase() === 'FAILED' ? 'FAILED' : smsStatus,
+          message_provider_status: smsStatus,
+          provider_message_id: providerId || smsId,
+          updated_at: new Date().toISOString()
+        };
+
+        await db
+          .schema('church')
+          .from('sms_logs')
+          .update(updateObj)
+          .or(`provider_message_id.eq.${smsId},idempotency_key.eq.${smsRef}`);
+      }
+
+      return NextResponse.json({ received: true, eventType: 'SMS_DELIVERY_UPDATE' });
+    }
+
+    // Extract key fields from Najiki payment payload
+    const { paymentIntentId, reference, status, amount, externalEntityId, providerPaymentId, failureReason, tenantCode, idempotencyKey } = payload;
 
     // Resolve tenant using tenantCode if available
     let resolvedTenantId: string | null = null;
@@ -70,12 +93,18 @@ export async function POST(request: Request) {
       }
     }
 
-    // Find transaction by either reference or paymentIntentId (we stored reference = idempotencyKey initially)
-    let { data: tx, error: txError } = await db
-      .from('wallet_transactions')
-      .select('*')
-      .or(`reference_code.eq.${reference},reference_id.eq.${reference},idempotency_key.eq.${paymentIntentId}`)
-      .maybeSingle();
+    // Find transaction by reference, idempotencyKey, or paymentIntentId
+    const searchRef = reference || idempotencyKey;
+    let query = db.from('wallet_transactions').select('*');
+    if (searchRef && paymentIntentId) {
+      query = query.or(`reference.eq.${searchRef},reference.eq.${paymentIntentId}`);
+    } else if (searchRef) {
+      query = query.eq('reference', searchRef);
+    } else if (paymentIntentId) {
+      query = query.eq('reference', paymentIntentId);
+    }
+
+    let { data: tx, error: txError } = await query.maybeSingle();
 
     if (txError) {
       console.error('[Najiki Webhook] DB lookup error:', txError);
@@ -123,7 +152,7 @@ export async function POST(request: Request) {
         .from('wallet_transactions')
         .update({
           status: 'failed',
-          provider_payload: payload
+          raw_provider_response: payload
         })
         .eq('id', tx.id);
 
@@ -152,7 +181,7 @@ async function handleSuccessManually(db: any, tx: any, payload: any, resolvedTen
     .from('wallet_transactions')
     .update({
       status: 'success',
-      provider_payload: payload
+      raw_provider_response: payload
     })
     .eq('id', tx.id);
 

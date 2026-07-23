@@ -135,6 +135,7 @@ export async function sendSingleSMS({
       // Record transaction history
       await adminSupabase.from('wallet_transactions').insert({
         tenant_id: churchId,
+        wallet_id: updatedWallet.id,
         amount: -balance.sms_rate,
         type: 'SMS_SENT',
         description: `Sent 1 SMS to ${finalPhone} via Najiki`,
@@ -221,6 +222,7 @@ export async function sendSingleSMS({
       // Record transaction history
       await adminSupabase.from('wallet_transactions').insert({
         tenant_id: churchId,
+        wallet_id: updatedWallet.id,
         amount: -balance.sms_rate,
         type: 'SMS_SENT',
         description: `Sent 1 SMS to ${finalPhone}`,

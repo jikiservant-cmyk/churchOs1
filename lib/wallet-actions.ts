@@ -4,16 +4,16 @@ import { createClient, createAdminClient } from '@/lib/supabase/server';
 import { revalidatePath } from 'next/cache';
 import { normalizeUgPhone } from './utils';
 
-// Helper to format phone for Najiki (accepts E.164 or standard international format)
+// Helper to format phone for Najiki (E.164 without plus or 256...)
 function formatPhoneForNajiki(phone: string): string {
-  // Najiki accepts both formats, let's just pass it through
-  // But ensure no special chars
+  const normalized = normalizeUgPhone(phone);
+  if (normalized) {
+    return normalized.replace('+', '');
+  }
   const cleaned = phone.replace(/\D/g, '');
-  // If starts with 256 (Uganda), we can keep as is or convert to 0... either is fine
-  if (cleaned.startsWith('256')) return `0${cleaned.slice(3)}`;
-  // If starts with 0, keep as is
-  if (cleaned.startsWith('0')) return cleaned;
-  // Otherwise return original cleaned number
+  if (cleaned.startsWith('0') && cleaned.length === 10) {
+    return `256${cleaned.slice(1)}`;
+  }
   return cleaned;
 }
 
@@ -44,28 +44,51 @@ export async function initiateNajikiPayment(formData: FormData) {
     const supabaseAdmin = await createAdminClient();
 
     // 1. Fetch tenant code from database
-    const { data: tenant, error: tenantError } = await supabaseAdmin
+    const { data: tenant } = await supabaseAdmin
       .from('tenants')
       .select('code')
       .eq('id', churchId)
       .maybeSingle();
 
-    if (tenantError) {
-      console.error('[Najiki] Failed to fetch tenant:', tenantError);
-      return { error: 'Failed to load tenant data' };
-    }
+    const { data: churchData } = await supabaseAdmin
+      .schema('church')
+      .from('churches')
+      .select('slug')
+      .eq('id', churchId)
+      .maybeSingle();
 
-    // Resolve tenantCode: use tenant.code first, then fallback to env var
-    let tenantCode = tenant?.code;
-    if (!tenantCode) {
-      // Fallback to env var if tenant doesn't have a code
-      tenantCode = process.env.NAJIKI_TENANT_CODE;
-      console.warn('[Najiki] No tenant code found in database, using env var fallback');
-    }
+    // Resolve tenantCode: use tenant.code first, then church.slug, then fallback to env var
+    let tenantCode = tenant?.code || churchData?.slug || process.env.NAJIKI_TENANT_CODE;
 
     if (!tenantCode) {
       console.error('[Najiki] No tenant code available (neither in database nor env)');
       return { error: 'Tenant code not configured' };
+    }
+
+    // Fetch or create wallet to obtain wallet_id
+    let { data: wallet } = await supabaseAdmin
+      .from('wallets')
+      .select('id')
+      .eq('tenant_id', churchId)
+      .maybeSingle();
+
+    if (!wallet) {
+      await supabaseAdmin
+        .from('tenants')
+        .upsert({ id: churchId, app_type: 'church', name: churchData?.slug || 'Church' });
+
+      const { data: newWallet } = await supabaseAdmin
+        .from('wallets')
+        .upsert({ tenant_id: churchId, balance: 0, sms_rate: 70, app_type: 'church' })
+        .select('id')
+        .single();
+
+      wallet = newWallet;
+    }
+
+    if (!wallet?.id) {
+      console.error('[Najiki] Wallet record missing for church:', churchId);
+      return { error: 'Wallet record missing for church' };
     }
 
     // 2. Create a pending transaction in our DB
@@ -73,14 +96,15 @@ export async function initiateNajikiPayment(formData: FormData) {
 
     const { error: txError } = await supabaseAdmin.from('wallet_transactions').insert({
       tenant_id: churchId,
+      wallet_id: wallet.id,
       amount: amount,
-      type: 'TOPUP',
+      direction: 'credit',
+      currency: 'UGX',
+      type: 'sms_topup',
       description: `Najiki Top-up for ${phoneNumber}`,
-      reference_code: reference,
+      reference: reference,
       status: 'pending',
-      product: 'sms',
-      revenue_ugx: 0,
-      created_by: 'system',
+      note: 'pending'
     });
 
     if (txError) {
@@ -94,16 +118,21 @@ export async function initiateNajikiPayment(formData: FormData) {
     const formattedPhone = formatPhoneForNajiki(phoneNumber);
 
     // 4. Call Najiki API
+    const idempotencyKey = `ik_church_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+
     const requestBody = {
-      amount: amount,
-      phoneNumber: formattedPhone,
-      reference: reference,
-      currency: 'UGX',
-      description: 'ChurchOS SMS Wallet Top-up',
+      applicationCode: applicationCode || 'church',
+      tenantCode: tenantCode,
+      paymentTypeCode: 'topup',
       externalEntityId: churchId,
-      metadata: { churchId, source: 'admin-dashboard' },
-      ...(applicationCode ? { applicationCode } : {}),
-      tenantCode: tenantCode
+      amount: amount,
+      currency: 'UGX',
+      phoneNumber: formattedPhone,
+      idempotencyKey: idempotencyKey,
+      metadata: {
+        churchId,
+        source: 'admin-dashboard'
+      }
     };
 
     console.log('[Najiki] Sending request to /api/payments:', JSON.stringify({ ...requestBody, phoneNumber: 'REDACTED' }));
@@ -112,8 +141,8 @@ export async function initiateNajikiPayment(formData: FormData) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-API-Key': apiKey, // Using recommended API key header
-        // Alternatively could use: 'Authorization': `Bearer ${apiKey}`
+        'Authorization': `Bearer ${apiKey}`,
+        'X-API-Key': apiKey,
       },
       body: JSON.stringify(requestBody),
     });
@@ -136,22 +165,21 @@ export async function initiateNajikiPayment(formData: FormData) {
         .from('wallet_transactions')
         .update({ 
           status: 'failed', 
-          provider_payload: { ...result, raw_response: responseText.slice(0, 500) } 
+          raw_provider_response: result 
         })
-        .eq('reference_code', reference);
+        .eq('reference', reference);
 
       return { error: result.error || result.message || 'Payment request failed' };
     }
 
-    // 5. Update transaction with Najiki paymentIntentId
+    // 5. Update transaction with Najiki response
     if (result.paymentIntentId) {
       await supabaseAdmin
         .from('wallet_transactions')
         .update({ 
-          idempotency_key: result.paymentIntentId,
-          provider_payload: result 
+          raw_provider_response: result 
         })
-        .eq('reference_code', reference);
+        .eq('reference', reference);
     }
 
     return { success: true, message: 'Payment prompt sent to your phone!', paymentIntentId: result.paymentIntentId, reference: reference };
@@ -191,20 +219,38 @@ export async function topUpWallet(formData: FormData): Promise<{ error?: string;
     // Record a transaction to maintain history
     const { data: { user } } = await supabase.auth.getUser();
 
-    const { error: txError } = await adminSupabase.from('wallet_transactions').insert({
-      tenant_id: churchId,
-      amount: amount,
-      type: 'TOPUP',
-      description: 'Test Top-up via Admin Dashboard',
-      reference_code: 'TOPUP_TEST_' + Date.now(),
-      status: 'success',
-      product: 'sms',
-      revenue_ugx: 0,
-      created_by: user?.id || 'system',
-    });
+    let { data: wallet } = await adminSupabase
+      .from('wallets')
+      .select('id')
+      .eq('tenant_id', churchId)
+      .maybeSingle();
 
-    if (txError) {
-      console.error('Failed to record top up transaction:', JSON.stringify(txError, null, 2));
+    if (!wallet) {
+      const { data: newWallet } = await adminSupabase
+        .from('wallets')
+        .upsert({ tenant_id: churchId, balance: 0, sms_rate: 70, app_type: 'church' })
+        .select('id')
+        .single();
+      wallet = newWallet;
+    }
+
+    if (wallet?.id) {
+      const { error: txError } = await adminSupabase.from('wallet_transactions').insert({
+        tenant_id: churchId,
+        wallet_id: wallet.id,
+        amount: amount,
+        direction: 'credit',
+        currency: 'UGX',
+        type: 'sms_topup',
+        description: 'Test Top-up via Admin Dashboard',
+        reference: 'TOPUP_TEST_' + Date.now(),
+        status: 'success',
+        note: 'Admin manual top-up'
+      });
+
+      if (txError) {
+        console.error('Failed to record top up transaction:', JSON.stringify(txError, null, 2));
+      }
     }
   } catch (err: any) {
     console.error('Unhandled exception in topUpWallet:', err);
