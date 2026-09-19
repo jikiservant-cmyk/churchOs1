@@ -34,10 +34,39 @@ export async function middleware(request: NextRequest) {
 
   // Refresh session if expired
   try {
+    const url = new URL(request.url);
+
+    // CSRF Protection for state-changing API mutations (H4 remediation)
+    if (url.pathname.startsWith('/api/') && ['POST', 'PUT', 'DELETE', 'PATCH'].includes(request.method)) {
+      const isPublicWebhook = url.pathname.includes('/webhook') || 
+                              url.pathname.includes('/billing/topup') ||
+                              url.pathname.includes('/sms/process-queue');
+      if (!isPublicWebhook) {
+        const secFetchSite = request.headers.get('sec-fetch-site');
+        const origin = request.headers.get('origin');
+        const host = request.headers.get('host');
+
+        // Block untrusted cross-site POSTs
+        if (secFetchSite === 'cross-site') {
+          return NextResponse.json({ error: 'Cross-origin request blocked' }, { status: 403 });
+        }
+
+        if (origin && host) {
+          try {
+            const originHost = new URL(origin).host;
+            if (originHost !== host) {
+              return NextResponse.json({ error: 'Origin mismatch' }, { status: 403 });
+            }
+          } catch {
+            return NextResponse.json({ error: 'Invalid origin header' }, { status: 403 });
+          }
+        }
+      }
+    }
+
     const { data: { user } } = await supabase.auth.getUser();
 
     // Protective Routing for Admin
-    const url = new URL(request.url);
     const pathParts = url.pathname.split('/');
     
     // Check if we are in an admin route: /c/[slug]/admin/... or /[slug]/admin/...

@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS church.churches (
   name text NOT NULL,
   code text UNIQUE,
   slug text NOT NULL UNIQUE,
-  passkey text DEFAULT '1234', -- 4-6 digit entrance code for ushers
+  passkey text, -- 4-6 digit entrance code for ushers (generated on provisioning)
   app_type text DEFAULT 'church', -- Added to match unified app structure
   theme_color text DEFAULT 'bg-blue-600',
   logo_url text,
@@ -180,6 +180,15 @@ BEGIN
     RAISE EXCEPTION 'Unauthorized: cannot provision workspace for another user';
   END IF;
 
+  -- Quota check: prevent user from provisioning multiple churches and squatting slugs
+  IF EXISTS (
+    SELECT 1
+    FROM public.admin_profiles
+    WHERE id = p_user_id AND tenant_id IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'You already belong to an existing church workspace. Multi-workspace creation is restricted.';
+  END IF;
+
   IF EXISTS (
     SELECT 1
     FROM church.churches
@@ -218,12 +227,14 @@ BEGIN
     id,
     name,
     slug,
+    passkey,
     app_type
   )
   VALUES (
     v_tenant_uuid,
     p_name,
     p_slug,
+    lpad(floor(random() * 900000 + 100000)::text, 6, '0'),
     'church'
   );
 
@@ -668,7 +679,9 @@ CREATE TABLE IF NOT EXISTS church.members (
   is_youth boolean DEFAULT false,
   status text DEFAULT 'active',
   created_at timestamptz DEFAULT now(),
-  updated_at timestamptz DEFAULT now()
+  updated_at timestamptz DEFAULT now(),
+
+  CONSTRAINT members_id_church_uniq UNIQUE (id, church_id)
 );
 
 -- Optimization: Index for faster multi-tenant member lookups
@@ -726,7 +739,8 @@ CREATE TABLE IF NOT EXISTS church.events (
   created_at timestamptz NOT NULL DEFAULT now(),
 
   -- useful for filtering
-  UNIQUE (church_id, service_type, event_date, start_time)
+  UNIQUE (church_id, service_type, event_date, start_time),
+  CONSTRAINT events_id_church_uniq UNIQUE (id, church_id)
 );
 
 -- Attendance Logs (bridge)
@@ -734,8 +748,8 @@ CREATE TABLE IF NOT EXISTS church.attendance_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   church_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
 
-  member_id uuid NOT NULL REFERENCES church.members(id) ON DELETE CASCADE,
-  event_id uuid NOT NULL REFERENCES church.events(id) ON DELETE CASCADE,
+  member_id uuid NOT NULL,
+  event_id uuid NOT NULL,
 
   attendance_status church.attendance_status NOT NULL DEFAULT 'absent',
   check_in_time timestamptz DEFAULT now(),
@@ -743,8 +757,9 @@ CREATE TABLE IF NOT EXISTS church.attendance_logs (
   recorded_by uuid REFERENCES auth.users(id) ON DELETE SET NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
 
-  CONSTRAINT attendance_logs_member_event_unique
-    UNIQUE (member_id, event_id)
+  CONSTRAINT al_member_tenant_fk FOREIGN KEY (member_id, church_id) REFERENCES church.members (id, church_id) ON DELETE CASCADE,
+  CONSTRAINT al_event_tenant_fk FOREIGN KEY (event_id, church_id) REFERENCES church.events (id, church_id) ON DELETE CASCADE,
+  CONSTRAINT attendance_logs_member_event_unique UNIQUE (member_id, event_id)
 );
 
 -- Optional: Attendance Flags
@@ -752,14 +767,15 @@ CREATE TABLE IF NOT EXISTS church.attendance_flags (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   church_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
 
-  member_id uuid NOT NULL REFERENCES church.members(id) ON DELETE CASCADE,
+  member_id uuid NOT NULL,
   flag_type church.attendance_flag_type NOT NULL,
   status church.attendance_flag_status NOT NULL DEFAULT 'open',
   notes text,
   created_at timestamptz NOT NULL DEFAULT now(),
 
-  -- One open flag of each type per member is typical for follow-up
-  UNIQUE (member_id, flag_type)
+  CONSTRAINT af_member_tenant_fk FOREIGN KEY (member_id, church_id) REFERENCES church.members (id, church_id) ON DELETE CASCADE,
+  -- One open flag of each type per member per church
+  CONSTRAINT flags_tenant_member_type_uniq UNIQUE (church_id, member_id, flag_type)
 );
 
 CREATE TABLE IF NOT EXISTS church.prayers (
@@ -1376,3 +1392,158 @@ SELECT cron.schedule('refresh-inactive-30-days-daily','0 2 * * *','SELECT church
 
 -- Schedule daily follow-up processing (at 2:10 AM)
 SELECT cron.schedule('process-inactive-30-days-followups-daily','10 2 * * *','SELECT church.process_inactive_30_days_followups();');
+
+-- 12. Visitors Table (H3 remediation)
+CREATE TABLE IF NOT EXISTS church.visitors (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  church_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
+  full_name text NOT NULL,
+  phone_number text NOT NULL,
+  email text,
+  gender text,
+  birthday date,
+  visitor_type text NOT NULL DEFAULT 'first_time',
+  source text,
+  home_church_name text,
+  home_church_city text,
+  home_church_pastor text,
+  notes text,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+ALTER TABLE church.visitors ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "visitors_tenant_select" ON church.visitors FOR SELECT TO authenticated USING (church_id = church.my_tenant_id());
+CREATE POLICY "visitors_tenant_insert" ON church.visitors FOR INSERT TO authenticated WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "visitors_tenant_update" ON church.visitors FOR UPDATE TO authenticated USING (church_id = church.my_tenant_id()) WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "visitors_tenant_delete" ON church.visitors FOR DELETE TO authenticated USING (church_id = church.my_tenant_id());
+CREATE POLICY "visitors_service_role" ON church.visitors FOR ALL TO service_role USING (true);
+
+-- 13. Broadcasts and SMS Queue (H3 remediation)
+CREATE TABLE IF NOT EXISTS church.broadcasts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
+  message_template text NOT NULL,
+  audience text NOT NULL DEFAULT 'all',
+  total_recipients int NOT NULL DEFAULT 0,
+  sent_count int NOT NULL DEFAULT 0,
+  failed_count int NOT NULL DEFAULT 0,
+  status text NOT NULL DEFAULT 'QUEUED',
+  created_by uuid REFERENCES auth.users(id) ON DELETE SET NULL,
+  created_at timestamptz DEFAULT now(),
+  completed_at timestamptz
+);
+
+ALTER TABLE church.broadcasts ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "broadcasts_tenant_select" ON church.broadcasts FOR SELECT TO authenticated USING (tenant_id = church.my_tenant_id());
+CREATE POLICY "broadcasts_service_role" ON church.broadcasts FOR ALL TO service_role USING (true);
+
+CREATE TABLE IF NOT EXISTS church.sms_queue (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
+  broadcast_id uuid REFERENCES church.broadcasts(id) ON DELETE CASCADE,
+  recipient_id text,
+  recipient_phone text NOT NULL,
+  message text NOT NULL,
+  sender_id text,
+  idempotency_key text UNIQUE,
+  status text NOT NULL DEFAULT 'PENDING',
+  attempts int NOT NULL DEFAULT 0,
+  max_attempts int NOT NULL DEFAULT 3,
+  last_error text,
+  scheduled_at timestamptz DEFAULT now(),
+  processed_at timestamptz,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+ALTER TABLE church.sms_queue ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "sms_queue_tenant_select" ON church.sms_queue FOR SELECT TO authenticated USING (tenant_id = church.my_tenant_id());
+CREATE POLICY "sms_queue_service_role" ON church.sms_queue FOR ALL TO service_role USING (true);
+
+-- Claim SMS Queue Batch (Skip Locked)
+CREATE OR REPLACE FUNCTION church.claim_sms_queue_batch(
+  p_tenant_id uuid DEFAULT NULL,
+  p_batch_size int DEFAULT 10
+)
+RETURNS SETOF church.sms_queue
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = church, public
+AS $$
+BEGIN
+  RETURN QUERY
+  UPDATE church.sms_queue q
+  SET status = 'PROCESSING',
+      updated_at = now()
+  WHERE q.id IN (
+    SELECT id
+    FROM church.sms_queue
+    WHERE status = 'PENDING'
+      AND scheduled_at <= now()
+      AND (p_tenant_id IS NULL OR tenant_id = p_tenant_id)
+    ORDER BY created_at ASC
+    LIMIT p_batch_size
+    FOR UPDATE SKIP LOCKED
+  )
+  RETURNING q.*;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION church.claim_sms_queue_batch(uuid, int) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.claim_sms_queue_batch(uuid, int) TO service_role;
+
+-- Process Topup Webhook RPC
+CREATE OR REPLACE FUNCTION public.process_topup_webhook(
+  p_reference text,
+  p_tenant_id uuid,
+  p_amount bigint,
+  p_payload jsonb DEFAULT '{}'::jsonb
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_tx_id uuid;
+  v_current_status text;
+BEGIN
+  IF p_amount <= 0 THEN
+    RAISE EXCEPTION 'Topup amount must be positive';
+  END IF;
+
+  SELECT id, status INTO v_tx_id, v_current_status
+  FROM public.wallet_transactions
+  WHERE (reference_code = p_reference OR reference = p_reference)
+    AND tenant_id = p_tenant_id
+  FOR UPDATE;
+
+  IF v_tx_id IS NULL THEN
+    RETURN false;
+  END IF;
+
+  IF v_current_status = 'success' THEN
+    RETURN true;
+  END IF;
+
+  UPDATE public.wallet_transactions
+  SET status = 'success',
+      raw_provider_response = p_payload
+  WHERE id = v_tx_id;
+
+  UPDATE public.wallets
+  SET balance = balance + p_amount,
+      last_updated = now()
+  WHERE tenant_id = p_tenant_id;
+
+  RETURN true;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION public.process_topup_webhook(text, uuid, bigint, jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.process_topup_webhook(text, uuid, bigint, jsonb) TO service_role;
+

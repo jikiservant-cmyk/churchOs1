@@ -7,12 +7,16 @@ import { ChurchEvent, AttendanceLog, AttendanceFlag, AttendanceFlagStatus } from
 import { SignJWT, jwtVerify } from 'jose';
 import { sendSingleSMS } from './sms-actions';
 
+import crypto from 'crypto';
+
 function getJwtSecret(): Uint8Array {
-  const jwtSecretValue = process.env.USHER_JWT_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const jwtSecretValue = process.env.USHER_JWT_SECRET || process.env.SUPABASE_JWT_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!jwtSecretValue) {
-    throw new Error('USHER_JWT_SECRET (or SUPABASE_SERVICE_ROLE_KEY) environment variable is not set. Cannot sign usher sessions.');
+    throw new Error('No secret available to sign usher sessions.');
   }
-  return new TextEncoder().encode(jwtSecretValue);
+  // Domain-separate the usher secret to prevent raw key reuse with the service role key
+  const derivedSecret = crypto.createHmac('sha256', 'usher_jwt_domain_separation').update(jwtSecretValue).digest();
+  return derivedSecret;
 }
 
 // In-memory throttling map to prevent brute-force attacks on usher passkeys (max 5 failed attempts per 60s)
@@ -47,8 +51,13 @@ function resetUsherAttempts(key: string) {
 
 export async function validateUsherPasskey(churchSlug: string, passkey: string) {
   try {
-    const normalizedSlug = churchSlug.toLowerCase().trim();
-    const rateLimit = checkUsherRateLimit(normalizedSlug);
+    // Canonicalize slug to prevent % wildcards and case variations from resetting throttle buckets
+    const canonicalSlug = churchSlug.toLowerCase().trim().replace(/[^a-z0-9-]/g, '');
+    if (!canonicalSlug) {
+      return { success: false, error: 'Invalid church identifier.' };
+    }
+
+    const rateLimit = checkUsherRateLimit(canonicalSlug);
     if (!rateLimit.allowed) {
       return { 
         success: false, 
@@ -56,15 +65,15 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
       };
     }
 
-    console.log('[validateUsherPasskey] Validating for slug:', normalizedSlug);
+    console.log('[validateUsherPasskey] Validating for slug:', canonicalSlug);
     const supabase = await createAdminClient();
     
-    // Use ilike logic or explicit lowercase to ensure slug matches even if URL is mixed case
+    // Use strict equality (.eq) instead of ilike so % and _ cannot act as wildcards
     const { data: church } = await supabase
       .schema('church')
       .from('churches')
       .select('id, name, passkey')
-      .ilike('slug', normalizedSlug)
+      .eq('slug', canonicalSlug)
       .maybeSingle();
 
     if (!church) {
@@ -72,13 +81,21 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
       return { success: false, error: 'Church not found.' };
     }
 
-    if (church.passkey?.toUpperCase() !== passkey.toUpperCase()) {
-      recordUsherFailedAttempt(normalizedSlug);
+    const expectedPasskey = (church.passkey || '').trim();
+    const providedPasskey = (passkey || '').trim();
+    
+    // Constant-time comparison to prevent timing side channels
+    const expectedBuf = Buffer.from(expectedPasskey);
+    const providedBuf = Buffer.from(providedPasskey);
+    const isMatch = expectedBuf.length === providedBuf.length && crypto.timingSafeEqual(expectedBuf, providedBuf);
+
+    if (!isMatch) {
+      recordUsherFailedAttempt(canonicalSlug);
       return { success: false, error: 'Invalid passkey. Please check and try again.' };
     }
 
     // Reset attempts upon successful verification
-    resetUsherAttempts(normalizedSlug);
+    resetUsherAttempts(canonicalSlug);
 
     const churchId = church.id;
     const churchName = church.name;
@@ -87,7 +104,7 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
     const token = await new SignJWT({
       church_id: churchId,
       church_name: churchName,
-      church_slug: churchSlug.toLowerCase(),
+      church_slug: canonicalSlug,
       role: 'usher'
     })
       .setProtectedHeader({ alg: 'HS256' })
@@ -96,7 +113,7 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
       .sign(getJwtSecret());
 
     const cookieStore = await cookies();
-    const cookieName = `usher_session_${churchSlug.toLowerCase()}`;
+    const cookieName = `usher_session_${canonicalSlug}`;
     
     cookieStore.set(cookieName, token, {
       httpOnly: true,
@@ -106,7 +123,7 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
       maxAge: 60 * 60 * 24 // 24 hours
     });
 
-    revalidatePath(`/${churchSlug}/usher/dashboard`);
+    revalidatePath(`/${canonicalSlug}/usher/dashboard`);
     return { success: true, churchName };
 
   } catch (error) {
@@ -119,17 +136,23 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
 }
 
 export async function getUsherSession(churchSlug: string) {
+  const canonicalSlug = churchSlug.toLowerCase().trim().replace(/[^a-z0-9-]/g, '');
+  if (!canonicalSlug) return null;
+
   const cookieStore = await cookies();
-  const cookieName = `usher_session_${churchSlug.toLowerCase()}`;
+  const cookieName = `usher_session_${canonicalSlug}`;
   const token = cookieStore.get(cookieName)?.value;
   
   if (!token) return null;
   
   try {
     const { payload } = await jwtVerify(token, getJwtSecret());
+    // Ensure the token's church_slug strictly matches the requested church URL slug
+    if (payload.church_slug !== canonicalSlug) {
+      return null;
+    }
     return payload as any;
   } catch (e) {
-    console.error('Usher session verification failed:', e);
     return null;
   }
 }
@@ -357,6 +380,19 @@ export async function markAttendance(churchSlug: string, eventId: string, member
       throw new Error('Could not find event details.');
     }
 
+    // 1b. Verify that the member belongs to this church (prevent cross-tenant attendance poisoning)
+    const { data: memberData, error: memberError } = await supabase
+      .schema('church')
+      .from('members')
+      .select('id')
+      .eq('id', memberId)
+      .eq('church_id', eventData.church_id)
+      .maybeSingle();
+
+    if (memberError || !memberData) {
+      throw new Error('Member does not belong to this church');
+    }
+
     // 2. Direct upsert into attendance_logs using Admin Client (bypasses RLS)
     const { data: existingLog } = await supabase
       .schema('church')
@@ -415,6 +451,17 @@ export async function removeAttendance(churchSlug: string, eventId: string, memb
       .single();
 
     if (!eventData) throw new Error('Event not found');
+
+    // 1b. Verify that member belongs to this church
+    const { data: memberData } = await supabase
+      .schema('church')
+      .from('members')
+      .select('id')
+      .eq('id', memberId)
+      .eq('church_id', eventData.church_id)
+      .maybeSingle();
+
+    if (!memberData) throw new Error('Member does not belong to this church');
 
     // 2. Direct delete from attendance_logs using Admin Client (bypasses RLS)
     // We include church_id for extra safety in multi-tenant environment

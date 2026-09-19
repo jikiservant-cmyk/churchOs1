@@ -21,28 +21,45 @@
 
 import { NextResponse } from 'next/server';
 import { processQueueBatch } from '@/lib/queue-actions';
+import crypto from 'crypto';
 
 const QUEUE_SECRET = process.env.QUEUE_PROCESSOR_SECRET;
 
-function isAuthorised(req: Request): boolean {
-  // No secret configured → open (useful for local dev, not recommended for production)
-  if (!QUEUE_SECRET) return true;
+function isAuthorised(req: Request): { authorized: boolean; reason?: string } {
+  // Fail closed if no secret is configured
+  if (!QUEUE_SECRET) {
+    return { authorized: false, reason: 'Queue processor secret not configured' };
+  }
 
   // POST: secret in header x-queue-secret
   const headerSecret = req.headers.get('x-queue-secret');
-  if (headerSecret === QUEUE_SECRET) return true;
+  if (headerSecret) {
+    const a = Buffer.from(headerSecret);
+    const b = Buffer.from(QUEUE_SECRET);
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+      return { authorized: true };
+    }
+  }
 
   // GET (Vercel Cron): secret in Authorization: Bearer <secret>
-  const bearerSecret = req.headers.get('authorization')?.replace('Bearer ', '');
-  if (bearerSecret === QUEUE_SECRET) return true;
+  const bearerSecret = req.headers.get('authorization')?.replace(/^Bearer\s+/i, '');
+  if (bearerSecret) {
+    const a = Buffer.from(bearerSecret);
+    const b = Buffer.from(QUEUE_SECRET);
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+      return { authorized: true };
+    }
+  }
 
-  return false;
+  return { authorized: false, reason: 'Unauthorized' };
 }
 
 // ── POST — called programmatically (fire-and-forget from /api/sms/enqueue) ──
 export async function POST(req: Request) {
-  if (!isAuthorised(req)) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const auth = isAuthorised(req);
+  if (!auth.authorized) {
+    const status = auth.reason === 'Queue processor secret not configured' ? 503 : 401;
+    return NextResponse.json({ error: auth.reason }, { status });
   }
 
   try {
@@ -61,8 +78,10 @@ export async function POST(req: Request) {
 
 // ── GET — called by Vercel Cron ─────────────────────────────────────────────
 export async function GET(req: Request) {
-  if (!isAuthorised(req)) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const auth = isAuthorised(req);
+  if (!auth.authorized) {
+    const status = auth.reason === 'Queue processor secret not configured' ? 503 : 401;
+    return NextResponse.json({ error: auth.reason }, { status });
   }
 
   try {

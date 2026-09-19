@@ -113,38 +113,40 @@ export async function sendSingleSMS({
       providerMessageId = najikiResult.smsId;
       providerStatus = najikiResult.status;
 
-      // 2. Perform Deduction
+      // 2. Perform Atomic Deduction via RPC (eliminates read-modify-write race)
       const adminSupabase = await createAdminClient();
       
-      const { data: updatedWallet, error: walletError } = await adminSupabase
-        .from('wallets')
-        .update({ 
-          balance: balance.balance - balance.sms_rate,
-          last_updated: new Date().toISOString()
-        })
-        .eq('tenant_id', churchId)
-        .gte('balance', balance.sms_rate)
-        .select()
-        .single();
+      const { data: debited, error: debitError } = await adminSupabase.rpc('decrement_wallet_balance', {
+        p_tenant_id: churchId,
+        p_amount: balance.sms_rate
+      });
 
-      if (walletError || !updatedWallet) {
-        console.error('[SMS Actions] Wallet deduction failed:', walletError);
+      if (debitError || !debited) {
+        console.error('[SMS Actions] Atomic wallet deduction failed:', debitError);
         throw new Error('Insufficient SMS balance or wallet update failed');
       }
 
+      const { data: walletData } = await adminSupabase
+        .from('wallets')
+        .select('id')
+        .eq('tenant_id', churchId)
+        .maybeSingle();
+
       // Record transaction history
-      await adminSupabase.from('wallet_transactions').insert({
-        tenant_id: churchId,
-        wallet_id: updatedWallet.id,
-        amount: -balance.sms_rate,
-        type: 'SMS_SENT',
-        description: `Sent 1 SMS to ${finalPhone} via Najiki`,
-        reference_code: `SMS_${logId}_${Date.now()}`,
-        status: 'success',
-        idempotency_key: logId,
-        product: 'sms',
-        reference_id: logId
-      });
+      if (walletData?.id) {
+        await adminSupabase.from('wallet_transactions').insert({
+          tenant_id: churchId,
+          wallet_id: walletData.id,
+          amount: -balance.sms_rate,
+          type: 'SMS_SENT',
+          description: `Sent 1 SMS to ${finalPhone} via Najiki`,
+          reference_code: `SMS_${logId}_${Date.now()}`,
+          status: 'success',
+          idempotency_key: logId,
+          product: 'sms',
+          reference_id: logId
+        });
+      }
     } else {
       // Fallback to Africa's Talking
       const apiKey = process.env.AT_API_KEY;
@@ -200,38 +202,40 @@ export async function sendSingleSMS({
       providerMessageId = recipient.messageId;
       providerStatus = recipient.status;
 
-      // 2. Perform Deduction
+      // 2. Perform Atomic Deduction via RPC (eliminates read-modify-write race)
       const adminSupabase = await createAdminClient();
       
-      const { data: updatedWallet, error: walletError } = await adminSupabase
-        .from('wallets')
-        .update({ 
-          balance: balance.balance - balance.sms_rate,
-          last_updated: new Date().toISOString()
-        })
-        .eq('tenant_id', churchId)
-        .gte('balance', balance.sms_rate)
-        .select()
-        .single();
+      const { data: debited, error: debitError } = await adminSupabase.rpc('decrement_wallet_balance', {
+        p_tenant_id: churchId,
+        p_amount: balance.sms_rate
+      });
 
-      if (walletError || !updatedWallet) {
-        console.error('[SMS Actions] Wallet deduction failed:', walletError);
+      if (debitError || !debited) {
+        console.error('[SMS Actions] Atomic wallet deduction failed:', debitError);
         throw new Error('Insufficient SMS balance or wallet update failed');
       }
 
+      const { data: walletData } = await adminSupabase
+        .from('wallets')
+        .select('id')
+        .eq('tenant_id', churchId)
+        .maybeSingle();
+
       // Record transaction history
-      await adminSupabase.from('wallet_transactions').insert({
-        tenant_id: churchId,
-        wallet_id: updatedWallet.id,
-        amount: -balance.sms_rate,
-        type: 'SMS_SENT',
-        description: `Sent 1 SMS to ${finalPhone}`,
-        reference_code: `SMS_${logId}_${Date.now()}`,
-        status: 'success',
-        idempotency_key: logId,
-        product: 'sms',
-        reference_id: logId
-      });
+      if (walletData?.id) {
+        await adminSupabase.from('wallet_transactions').insert({
+          tenant_id: churchId,
+          wallet_id: walletData.id,
+          amount: -balance.sms_rate,
+          type: 'SMS_SENT',
+          description: `Sent 1 SMS to ${finalPhone}`,
+          reference_code: `SMS_${logId}_${Date.now()}`,
+          status: 'success',
+          idempotency_key: logId,
+          product: 'sms',
+          reference_id: logId
+        });
+      }
     }
 
     // 3. Update Log to Final Status

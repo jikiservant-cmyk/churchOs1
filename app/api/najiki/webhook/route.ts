@@ -136,17 +136,17 @@ export async function POST(request: Request) {
     // Handle success
     if (status === 'success') {
       try {
-        // ALWAYS pass tx.amount (the verified database amount) into process_topup_webhook
+        // ALWAYS pass tx.amount and tx.tenant_id (the verified database records) into process_topup_webhook
         const { data: rpcResult, error: rpcErr } = await db.rpc('process_topup_webhook', {
           p_reference: tx.reference_code || reference,
-          p_tenant_id: resolvedTenantId || tx.tenant_id,
+          p_tenant_id: tx.tenant_id,
           p_amount: tx.amount,
           p_payload: payload
         });
 
         if (rpcErr) {
           console.warn('[Najiki Webhook] process_topup_webhook RPC failed, falling back to manual:', rpcErr);
-          await handleSuccessManually(db, tx, payload, resolvedTenantId);
+          await handleSuccessManually(db, tx, payload);
         } else {
           console.log('[Najiki Webhook] RPC succeeded:', rpcResult);
         }
@@ -156,7 +156,7 @@ export async function POST(request: Request) {
         return NextResponse.json({ received: true });
 
       } catch (fallbackErr) {
-        await handleSuccessManually(db, tx, payload, resolvedTenantId);
+        await handleSuccessManually(db, tx, payload);
         revalidatePath('/', 'layout');
         return NextResponse.json({ received: true });
       }
@@ -183,21 +183,30 @@ export async function POST(request: Request) {
   }
 }
 
-async function handleSuccessManually(db: any, tx: any, payload: any, resolvedTenantId: string | null) {
-  // 1. Increment wallet balance
-  await db.rpc('increment_wallet_balance', {
-    p_tenant_id: resolvedTenantId || tx.tenant_id,
-    p_amount: tx.amount
-  });
-
-  // 2. Mark transaction as successful
-  await db
+async function handleSuccessManually(db: any, tx: any, payload: any) {
+  // Idempotency guard: update status from 'pending' to 'success' atomically
+  const { data: updatedTx, error: updateErr } = await db
     .from('wallet_transactions')
     .update({
       status: 'success',
-      raw_provider_response: payload
+      raw_provider_response: payload,
+      updated_at: new Date().toISOString()
     })
-    .eq('id', tx.id);
+    .eq('id', tx.id)
+    .eq('status', 'pending')
+    .select('id')
+    .maybeSingle();
 
-  console.log('[Najiki Webhook] Manual processing successful');
+  if (updateErr || !updatedTx) {
+    console.warn('[Najiki Webhook] Transaction already processed or cannot transition from pending:', tx.id);
+    return;
+  }
+
+  // Increment wallet balance ONLY for the transaction's verified tenant
+  await db.rpc('increment_wallet_balance', {
+    p_tenant_id: tx.tenant_id,
+    p_amount: tx.amount
+  });
+
+  console.log('[Najiki Webhook] Manual processing successful for tenant:', tx.tenant_id);
 }

@@ -15,7 +15,7 @@
 
 import { NextResponse } from 'next/server';
 import { createClient as createServerClient } from '@/lib/supabase/server';
-import { enqueueBroadcast } from '@/lib/queue-actions';
+import { enqueueBroadcast, processQueueBatch } from '@/lib/queue-actions';
 
 export async function POST(req: Request) {
   try {
@@ -104,19 +104,9 @@ export async function POST(req: Request) {
 
     // ── Kick off processing in the background ───────────────────────────────
     // This means delivery starts immediately without waiting for a cron tick.
-    // We fire-and-forget — the response is already sent to the client.
-    const host    = req.headers.get('host') ?? '';
-    const proto   = host.startsWith('localhost') ? 'http' : 'https';
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? `${proto}://${host}`;
-
-    fetch(`${baseUrl}/api/sms/process-queue`, {
-      method: 'POST',
-      headers: {
-        'Content-Type':    'application/json',
-        'x-queue-secret':  process.env.QUEUE_PROCESSOR_SECRET ?? '',
-      },
-      body: JSON.stringify({ churchId }),
-    }).catch(err => console.warn('[Enqueue] Background trigger failed (non-fatal):', err));
+    // Executed in-process asynchronously to prevent exposing secrets to untrusted host headers.
+    processQueueBatch({ tenantId: churchId, batchSize: 15 })
+      .catch(err => console.warn('[Enqueue] Background trigger failed (non-fatal):', err));
 
     // ── Respond ─────────────────────────────────────────────────────────────
     return NextResponse.json({
