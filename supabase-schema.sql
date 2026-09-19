@@ -180,9 +180,14 @@ BEGIN
     RAISE EXCEPTION 'User ID is required';
   END IF;
 
-  -- Ensure caller matches p_user_id unless called via service_role bypass
+  -- Ensure caller is authenticated and matches p_user_id unless called via service_role bypass
   IF auth.uid() IS NOT NULL AND p_user_id IS DISTINCT FROM auth.uid() THEN
     RAISE EXCEPTION 'Unauthorized: cannot provision workspace for another user';
+  END IF;
+
+  -- Enforce creator role must be pastor
+  IF p_role IS NULL OR p_role <> 'pastor' THEN
+    RAISE EXCEPTION 'Only pastor role can provision church workspaces';
   END IF;
 
   -- Quota check with lock: prevent concurrent double provisioning (F10 remediation)
@@ -226,10 +231,6 @@ BEGIN
 
   IF v_user_email IS NULL THEN
     RAISE EXCEPTION 'User email not found. Please try logging in again.';
-  END IF;
-
-  IF p_role IS NULL THEN
-    RAISE EXCEPTION 'Role is required';
   END IF;
 
   v_role := p_role::public.admin_role_enum;
@@ -515,229 +516,97 @@ $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 REVOKE EXECUTE ON FUNCTION public.decrement_wallet_balance(uuid, bigint) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.decrement_wallet_balance(uuid, bigint) TO service_role;
 
--- Create church.my_tenant_id() helper function FIRST (before policies use it)
-CREATE OR REPLACE FUNCTION church.my_tenant_id()
-RETURNS uuid AS $$
+-- RPC: Credit wallet (Service Role Only)
+CREATE OR REPLACE FUNCTION public.credit_wallet(p_tenant_id uuid, p_amount bigint)
+RETURNS void AS $$
 BEGIN
-  RETURN (
-    SELECT tenant_id::uuid 
-    FROM public.admin_profiles 
-    WHERE id = auth.uid()
-    LIMIT 1
-  );
+  IF p_amount <= 0 THEN
+    RAISE EXCEPTION 'Credit amount must be positive';
+  END IF;
+
+  UPDATE public.wallets
+  SET balance = balance + p_amount,
+      last_updated = now()
+  WHERE tenant_id = p_tenant_id;
 END;
-$$ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, church;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
--- 8. Consolidated RLS Policies for Other Tables
-ALTER TABLE church.sms_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.wallets ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.wallet_transactions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.billing_events ENABLE ROW LEVEL SECURITY;
-ALTER TABLE church.members ENABLE ROW LEVEL SECURITY;
-ALTER TABLE church.new_converts ENABLE ROW LEVEL SECURITY;
-ALTER TABLE church.events ENABLE ROW LEVEL SECURITY;
-ALTER TABLE church.prayers ENABLE ROW LEVEL SECURITY;
-ALTER TABLE church.small_groups ENABLE ROW LEVEL SECURITY;
-ALTER TABLE church.donations ENABLE ROW LEVEL SECURITY;
+REVOKE EXECUTE ON FUNCTION public.credit_wallet(uuid, bigint) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.credit_wallet(uuid, bigint) TO service_role;
 
--- SMS Logs Policies
-DROP POLICY IF EXISTS "Pastors can manage their church sms logs" ON church.sms_logs;
-DROP POLICY IF EXISTS "sms_logs_rw_select" ON church.sms_logs;
-DROP POLICY IF EXISTS "sms_logs_rw_update" ON church.sms_logs;
-DROP POLICY IF EXISTS "sms_logs_insert" ON church.sms_logs;
-DROP POLICY IF EXISTS "sms_logs_delete" ON church.sms_logs;
-CREATE POLICY "sms_logs_rw_select"
-  ON church.sms_logs FOR SELECT
-  TO authenticated
-  USING (tenant_id = church.my_tenant_id());
-CREATE POLICY "sms_logs_rw_update"
-  ON church.sms_logs FOR UPDATE
-  TO authenticated
-  USING (tenant_id = church.my_tenant_id())
-  WITH CHECK (tenant_id = church.my_tenant_id());
-CREATE POLICY "sms_logs_insert"
-  ON church.sms_logs FOR INSERT
-  TO authenticated
-  WITH CHECK (tenant_id = church.my_tenant_id());
-CREATE POLICY "sms_logs_delete"
-  ON church.sms_logs FOR DELETE
-  TO authenticated
-  USING (tenant_id = church.my_tenant_id());
+-- RPC: Credit SMS wallet (Service Role Only)
+CREATE OR REPLACE FUNCTION public.credit_sms_wallet(p_tenant_id uuid, p_amount bigint)
+RETURNS void AS $$
+BEGIN
+  IF p_amount <= 0 THEN
+    RAISE EXCEPTION 'Credit amount must be positive';
+  END IF;
 
--- Wallets Policies
-DROP POLICY IF EXISTS "Pastors can view their church wallet" ON public.wallets;
-CREATE POLICY "Pastors can view their church wallet"
-  ON public.wallets FOR SELECT
-  TO authenticated
-  USING (tenant_id = church.my_tenant_id());
+  UPDATE public.wallets
+  SET balance = balance + p_amount,
+      last_updated = now()
+  WHERE tenant_id = p_tenant_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
--- Transactions Policies
-DROP POLICY IF EXISTS "Pastors can view their church transactions" ON public.wallet_transactions;
-CREATE POLICY "Pastors can view their church transactions"
-  ON public.wallet_transactions FOR SELECT
-  TO authenticated
-  USING (tenant_id = church.my_tenant_id());
+REVOKE EXECUTE ON FUNCTION public.credit_sms_wallet(uuid, bigint) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.credit_sms_wallet(uuid, bigint) TO service_role;
 
--- Members Policies using church.my_tenant_id()
-DROP POLICY IF EXISTS "Pastors can manage their members" ON church.members;
-DROP POLICY IF EXISTS "members_rw_select" ON church.members;
-DROP POLICY IF EXISTS "members_rw_update" ON church.members;
-DROP POLICY IF EXISTS "members_insert" ON church.members;
-DROP POLICY IF EXISTS "members_delete" ON church.members;
-CREATE POLICY "members_rw_select"
-  ON church.members FOR SELECT
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
-CREATE POLICY "members_rw_update"
-  ON church.members FOR UPDATE
-  TO authenticated
-  USING (church_id = church.my_tenant_id())
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "members_insert"
-  ON church.members FOR INSERT
-  TO authenticated
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "members_delete"
-  ON church.members FOR DELETE
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
+-- RPC: Apply wallet transaction (Service Role / Authenticated Only, No Anon)
+CREATE OR REPLACE FUNCTION public.apply_wallet_transaction(
+  p_tenant_id uuid,
+  p_amount bigint,
+  p_tx_type text,
+  p_reference text DEFAULT NULL
+)
+RETURNS void AS $$
+DECLARE
+  v_wallet_id uuid;
+BEGIN
+  SELECT id INTO v_wallet_id FROM public.wallets WHERE tenant_id = p_tenant_id;
+  IF v_wallet_id IS NULL THEN
+    RAISE EXCEPTION 'Wallet not found for tenant';
+  END IF;
 
--- New Converts Policies using church.my_tenant_id()
-DROP POLICY IF EXISTS "Pastors can manage their new converts" ON church.new_converts;
-DROP POLICY IF EXISTS "new_converts_rw_select" ON church.new_converts;
-DROP POLICY IF EXISTS "new_converts_rw_update" ON church.new_converts;
-DROP POLICY IF EXISTS "new_converts_insert" ON church.new_converts;
-DROP POLICY IF EXISTS "new_converts_delete" ON church.new_converts;
-CREATE POLICY "new_converts_rw_select"
-  ON church.new_converts FOR SELECT
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
-CREATE POLICY "new_converts_rw_update"
-  ON church.new_converts FOR UPDATE
-  TO authenticated
-  USING (church_id = church.my_tenant_id())
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "new_converts_insert"
-  ON church.new_converts FOR INSERT
-  TO authenticated
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "new_converts_delete"
-  ON church.new_converts FOR DELETE
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
+  IF p_tx_type = 'credit' OR p_tx_type = 'topup' THEN
+    UPDATE public.wallets
+    SET balance = balance + p_amount,
+        last_updated = now()
+    WHERE id = v_wallet_id;
+  ELSIF p_tx_type = 'debit' OR p_tx_type = 'sms' THEN
+    UPDATE public.wallets
+    SET balance = balance - p_amount,
+        last_updated = now()
+    WHERE id = v_wallet_id AND balance >= p_amount;
+  END IF;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
--- Events Policies using church.my_tenant_id()
-DROP POLICY IF EXISTS "Pastors can manage their events" ON church.events;
-DROP POLICY IF EXISTS "events_rw_select" ON church.events;
-DROP POLICY IF EXISTS "events_rw_update" ON church.events;
-DROP POLICY IF EXISTS "events_insert" ON church.events;
-DROP POLICY IF EXISTS "events_delete" ON church.events;
-CREATE POLICY "events_rw_select"
-  ON church.events FOR SELECT
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
-CREATE POLICY "events_rw_update"
-  ON church.events FOR UPDATE
-  TO authenticated
-  USING (church_id = church.my_tenant_id())
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "events_insert"
-  ON church.events FOR INSERT
-  TO authenticated
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "events_delete"
-  ON church.events FOR DELETE
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
+REVOKE EXECUTE ON FUNCTION public.apply_wallet_transaction(uuid, bigint, text, text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.apply_wallet_transaction(uuid, bigint, text, text) TO service_role;
 
--- Prayers Policies using church.my_tenant_id()
-DROP POLICY IF EXISTS "Pastors can manage their prayers" ON church.prayers;
-DROP POLICY IF EXISTS "prayers_rw_select" ON church.prayers;
-DROP POLICY IF EXISTS "prayers_rw_update" ON church.prayers;
-DROP POLICY IF EXISTS "prayers_insert" ON church.prayers;
-DROP POLICY IF EXISTS "prayers_delete" ON church.prayers;
-CREATE POLICY "prayers_rw_select"
-  ON church.prayers FOR SELECT
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
-CREATE POLICY "prayers_rw_update"
-  ON church.prayers FOR UPDATE
-  TO authenticated
-  USING (church_id = church.my_tenant_id())
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "prayers_insert"
-  ON church.prayers FOR INSERT
-  TO authenticated
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "prayers_delete"
-  ON church.prayers FOR DELETE
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
+-- RPC: Cascade delete church tenant (Service Role Only)
+CREATE OR REPLACE FUNCTION church.delete_church_tenant_cascade(p_tenant_id uuid)
+RETURNS void AS $$
+BEGIN
+  IF p_tenant_id IS NULL THEN
+    RAISE EXCEPTION 'Tenant ID is required';
+  END IF;
 
--- Small Groups Policies using church.my_tenant_id()
-DROP POLICY IF EXISTS "Pastors can manage their small_groups" ON church.small_groups;
-DROP POLICY IF EXISTS "small_groups_rw_select" ON church.small_groups;
-DROP POLICY IF EXISTS "small_groups_rw_update" ON church.small_groups;
-DROP POLICY IF EXISTS "small_groups_insert" ON church.small_groups;
-DROP POLICY IF EXISTS "small_groups_delete" ON church.small_groups;
-CREATE POLICY "small_groups_rw_select"
-  ON church.small_groups FOR SELECT
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
-CREATE POLICY "small_groups_rw_update"
-  ON church.small_groups FOR UPDATE
-  TO authenticated
-  USING (church_id = church.my_tenant_id())
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "small_groups_insert"
-  ON church.small_groups FOR INSERT
-  TO authenticated
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "small_groups_delete"
-  ON church.small_groups FOR DELETE
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
+  DELETE FROM church.churches WHERE id = p_tenant_id;
+  DELETE FROM public.tenants WHERE id = p_tenant_id;
+  DELETE FROM public.admin_profiles WHERE tenant_id = p_tenant_id;
+  DELETE FROM public.wallets WHERE tenant_id = p_tenant_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = church, public, auth;
 
--- Donations Policies using church.my_tenant_id()
-DROP POLICY IF EXISTS "Pastors can manage their donations" ON church.donations;
-DROP POLICY IF EXISTS "donations_rw_select" ON church.donations;
-DROP POLICY IF EXISTS "donations_rw_update" ON church.donations;
-DROP POLICY IF EXISTS "donations_insert" ON church.donations;
-DROP POLICY IF EXISTS "donations_delete" ON church.donations;
-CREATE POLICY "donations_rw_select"
-  ON church.donations FOR SELECT
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
-CREATE POLICY "donations_rw_update"
-  ON church.donations FOR UPDATE
-  TO authenticated
-  USING (church_id = church.my_tenant_id())
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "donations_insert"
-  ON church.donations FOR INSERT
-  TO authenticated
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "donations_delete"
-  ON church.donations FOR DELETE
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
+REVOKE EXECUTE ON FUNCTION church.delete_church_tenant_cascade(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.delete_church_tenant_cascade(uuid) TO service_role;
 
--- Service Role Bypass for all
-CREATE POLICY "Service role bypass on sms_logs" ON church.sms_logs TO service_role USING (true);
-CREATE POLICY "Service role bypass on wallets" ON public.wallets TO service_role USING (true);
-CREATE POLICY "Service role bypass on wallet_transactions" ON public.wallet_transactions TO service_role USING (true);
-CREATE POLICY "Service role bypass on billing_events" ON public.billing_events TO service_role USING (true);
-CREATE POLICY "Service role bypass on members" ON church.members TO service_role USING (true);
-CREATE POLICY "Service role bypass on new_converts" ON church.new_converts TO service_role USING (true);
-CREATE POLICY "Service role bypass on events" ON church.events TO service_role USING (true);
-CREATE POLICY "Service role bypass on prayers" ON church.prayers TO service_role USING (true);
-CREATE POLICY "Service role bypass on small_groups" ON church.small_groups TO service_role USING (true);
-CREATE POLICY "Service role bypass on donations" ON church.donations TO service_role USING (true);
-
--- 9. Create missing tables for members and new converts
+-- 8. Core Schema Tables for Members, Converts, Events, Attendance, Prayers, Groups, Donations
 CREATE TABLE IF NOT EXISTS church.members (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-  church_id uuid REFERENCES church.churches(id) NOT NULL,
+  church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   full_name text NOT NULL,
   code text UNIQUE,
   phone_number text,
@@ -752,13 +621,12 @@ CREATE TABLE IF NOT EXISTS church.members (
   CONSTRAINT members_id_church_uniq UNIQUE (id, church_id)
 );
 
--- Optimization: Index for faster multi-tenant member lookups
 CREATE INDEX IF NOT EXISTS idx_members_church_id ON church.members(church_id);
 CREATE INDEX IF NOT EXISTS idx_members_phone_number ON church.members(phone_number);
 
 CREATE TABLE IF NOT EXISTS church.new_converts (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-  church_id uuid REFERENCES church.churches(id) NOT NULL,
+  church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   name text NOT NULL,
   code text UNIQUE,
   contact text,
@@ -767,32 +635,8 @@ CREATE TABLE IF NOT EXISTS church.new_converts (
   created_at timestamptz DEFAULT now()
 );
 
--- Optimization: Index for faster multi-tenant convert lookups
 CREATE INDEX IF NOT EXISTS idx_new_converts_church_id ON church.new_converts(church_id);
 
--- Optimization: Index for attendance logs
-CREATE INDEX IF NOT EXISTS idx_attendance_logs_event_member ON church.attendance_logs(event_id, member_id);
-CREATE INDEX IF NOT EXISTS idx_attendance_logs_church_id ON church.attendance_logs(church_id);
-
--- Enable RLS for new tables
-ALTER TABLE church.members ENABLE ROW LEVEL SECURITY;
-ALTER TABLE church.new_converts ENABLE ROW LEVEL SECURITY;
-
--- 10. Insert initial demo data for Grace Church
-INSERT INTO church.churches (id, name, slug, passkey, theme_color, logo_url)
-VALUES (
-  '11111111-1111-1111-1111-111111111111',
-  'Grace Church Kampala', 
-  'grace', 
-  '829471',
-  'bg-green-600', 
-  'https://picsum.photos/seed/grace/200/200'
-) ON CONFLICT (id) DO UPDATE SET 
-  slug = EXCLUDED.slug,
-  passkey = COALESCE(church.churches.passkey, EXCLUDED.passkey);
-
--- 11. Tables for Dashboard (Events, Attendance, Prayers, Groups, Donations)
--- Events / Services
 CREATE TABLE IF NOT EXISTS church.events (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   church_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
@@ -809,12 +653,10 @@ CREATE TABLE IF NOT EXISTS church.events (
   created_by uuid REFERENCES auth.users(id) ON DELETE SET NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
 
-  -- useful for filtering
   UNIQUE (church_id, service_type, event_date, start_time),
   CONSTRAINT events_id_church_uniq UNIQUE (id, church_id)
 );
 
--- Attendance Logs (bridge)
 CREATE TABLE IF NOT EXISTS church.attendance_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   church_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
@@ -833,7 +675,9 @@ CREATE TABLE IF NOT EXISTS church.attendance_logs (
   CONSTRAINT attendance_logs_member_event_unique UNIQUE (member_id, event_id)
 );
 
--- Optional: Attendance Flags
+CREATE INDEX IF NOT EXISTS idx_attendance_logs_event_member ON church.attendance_logs(event_id, member_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_logs_church_id ON church.attendance_logs(church_id);
+
 CREATE TABLE IF NOT EXISTS church.attendance_flags (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   church_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
@@ -845,23 +689,22 @@ CREATE TABLE IF NOT EXISTS church.attendance_flags (
   created_at timestamptz NOT NULL DEFAULT now(),
 
   CONSTRAINT af_member_tenant_fk FOREIGN KEY (member_id, church_id) REFERENCES church.members (id, church_id) ON DELETE CASCADE,
-  -- One open flag of each type per member per church
   CONSTRAINT flags_tenant_member_type_uniq UNIQUE (church_id, member_id, flag_type)
 );
 
 CREATE TABLE IF NOT EXISTS church.prayers (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-  church_id uuid REFERENCES church.churches(id) NOT NULL,
+  church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   submitter_name text NOT NULL,
   code text UNIQUE,
   body text NOT NULL,
-  status text DEFAULT 'open', -- 'open', 'answered'
+  status text DEFAULT 'open',
   created_at timestamptz DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS church.small_groups (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-  church_id uuid REFERENCES church.churches(id) NOT NULL,
+  church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   name text NOT NULL,
   code text UNIQUE,
   leader_name text NOT NULL,
@@ -872,18 +715,172 @@ CREATE TABLE IF NOT EXISTS church.small_groups (
 
 CREATE TABLE IF NOT EXISTS church.donations (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-  church_id uuid REFERENCES church.churches(id) NOT NULL,
-  category text NOT NULL, -- 'Tithes', 'Offerings', 'Missions'
+  church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
+  category text NOT NULL,
   amount_cents bigint NOT NULL,
   created_at timestamptz DEFAULT now()
 );
 
+-- Initial demo data for Grace Church (MT-01: rotated static passkey to dynamic 6-digit CSPRNG)
+INSERT INTO church.churches (id, name, slug, passkey, theme_color, logo_url)
+VALUES (
+  '11111111-1111-1111-1111-111111111111',
+  'Grace Church Kampala', 
+  'grace', 
+  lpad(floor(random() * 900000 + 100000)::text, 6, '0'),
+  'bg-green-600', 
+  'https://picsum.photos/seed/grace/200/200'
+) ON CONFLICT (id) DO UPDATE SET 
+  slug = EXCLUDED.slug,
+  passkey = COALESCE(church.churches.passkey, EXCLUDED.passkey);
+
+-- Helper function church.my_tenant_id()
+CREATE OR REPLACE FUNCTION church.my_tenant_id()
+RETURNS uuid AS $$
+BEGIN
+  RETURN (
+    SELECT tenant_id::uuid 
+    FROM public.admin_profiles 
+    WHERE id = auth.uid()
+    LIMIT 1
+  );
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, church;
+
+-- 9. Consolidated RLS Policies (MT-03)
+ALTER TABLE church.sms_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.wallets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.wallet_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.billing_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE church.members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE church.new_converts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE church.events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE church.attendance_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE church.attendance_flags ENABLE ROW LEVEL SECURITY;
 ALTER TABLE church.prayers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE church.small_groups ENABLE ROW LEVEL SECURITY;
 ALTER TABLE church.donations ENABLE ROW LEVEL SECURITY;
+
+-- SMS Logs Policies
+DROP POLICY IF EXISTS "Pastors can manage their church sms logs" ON church.sms_logs;
+DROP POLICY IF EXISTS "sms_logs_rw_select" ON church.sms_logs;
+DROP POLICY IF EXISTS "sms_logs_rw_update" ON church.sms_logs;
+DROP POLICY IF EXISTS "sms_logs_insert" ON church.sms_logs;
+DROP POLICY IF EXISTS "sms_logs_delete" ON church.sms_logs;
+CREATE POLICY "sms_logs_rw_select" ON church.sms_logs FOR SELECT TO authenticated USING (tenant_id = church.my_tenant_id());
+CREATE POLICY "sms_logs_rw_update" ON church.sms_logs FOR UPDATE TO authenticated USING (tenant_id = church.my_tenant_id()) WITH CHECK (tenant_id = church.my_tenant_id());
+CREATE POLICY "sms_logs_insert" ON church.sms_logs FOR INSERT TO authenticated WITH CHECK (tenant_id = church.my_tenant_id());
+CREATE POLICY "sms_logs_delete" ON church.sms_logs FOR DELETE TO authenticated USING (tenant_id = church.my_tenant_id());
+
+-- Wallets Policies
+DROP POLICY IF EXISTS "Pastors can view their church wallet" ON public.wallets;
+CREATE POLICY "Pastors can view their church wallet" ON public.wallets FOR SELECT TO authenticated USING (tenant_id = church.my_tenant_id());
+
+-- Transactions Policies
+DROP POLICY IF EXISTS "Pastors can view their church transactions" ON public.wallet_transactions;
+CREATE POLICY "Pastors can view their church transactions" ON public.wallet_transactions FOR SELECT TO authenticated USING (tenant_id = church.my_tenant_id());
+
+-- Members Policies
+DROP POLICY IF EXISTS "Pastors can manage their members" ON church.members;
+DROP POLICY IF EXISTS "members_rw_select" ON church.members;
+DROP POLICY IF EXISTS "members_rw_update" ON church.members;
+DROP POLICY IF EXISTS "members_insert" ON church.members;
+DROP POLICY IF EXISTS "members_delete" ON church.members;
+CREATE POLICY "members_rw_select" ON church.members FOR SELECT TO authenticated USING (church_id = church.my_tenant_id());
+CREATE POLICY "members_rw_update" ON church.members FOR UPDATE TO authenticated USING (church_id = church.my_tenant_id()) WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "members_insert" ON church.members FOR INSERT TO authenticated WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "members_delete" ON church.members FOR DELETE TO authenticated USING (church_id = church.my_tenant_id());
+
+-- New Converts Policies
+DROP POLICY IF EXISTS "Pastors can manage their new converts" ON church.new_converts;
+DROP POLICY IF EXISTS "new_converts_rw_select" ON church.new_converts;
+DROP POLICY IF EXISTS "new_converts_rw_update" ON church.new_converts;
+DROP POLICY IF EXISTS "new_converts_insert" ON church.new_converts;
+DROP POLICY IF EXISTS "new_converts_delete" ON church.new_converts;
+CREATE POLICY "new_converts_rw_select" ON church.new_converts FOR SELECT TO authenticated USING (church_id = church.my_tenant_id());
+CREATE POLICY "new_converts_rw_update" ON church.new_converts FOR UPDATE TO authenticated USING (church_id = church.my_tenant_id()) WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "new_converts_insert" ON church.new_converts FOR INSERT TO authenticated WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "new_converts_delete" ON church.new_converts FOR DELETE TO authenticated USING (church_id = church.my_tenant_id());
+
+-- Events Policies
+DROP POLICY IF EXISTS "Pastors can manage their events" ON church.events;
+DROP POLICY IF EXISTS "events_rw_select" ON church.events;
+DROP POLICY IF EXISTS "events_rw_update" ON church.events;
+DROP POLICY IF EXISTS "events_insert" ON church.events;
+DROP POLICY IF EXISTS "events_delete" ON church.events;
+CREATE POLICY "events_rw_select" ON church.events FOR SELECT TO authenticated USING (church_id = church.my_tenant_id());
+CREATE POLICY "events_rw_update" ON church.events FOR UPDATE TO authenticated USING (church_id = church.my_tenant_id()) WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "events_insert" ON church.events FOR INSERT TO authenticated WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "events_delete" ON church.events FOR DELETE TO authenticated USING (church_id = church.my_tenant_id());
+
+-- Attendance Logs Policies
+DROP POLICY IF EXISTS "Pastors can manage their attendance logs" ON church.attendance_logs;
+DROP POLICY IF EXISTS "attendance_logs_rw_select" ON church.attendance_logs;
+DROP POLICY IF EXISTS "attendance_logs_rw_update" ON church.attendance_logs;
+DROP POLICY IF EXISTS "attendance_logs_insert" ON church.attendance_logs;
+DROP POLICY IF EXISTS "attendance_logs_delete" ON church.attendance_logs;
+CREATE POLICY "attendance_logs_rw_select" ON church.attendance_logs FOR SELECT TO authenticated USING (church_id = church.my_tenant_id());
+CREATE POLICY "attendance_logs_rw_update" ON church.attendance_logs FOR UPDATE TO authenticated USING (church_id = church.my_tenant_id()) WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "attendance_logs_insert" ON church.attendance_logs FOR INSERT TO authenticated WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "attendance_logs_delete" ON church.attendance_logs FOR DELETE TO authenticated USING (church_id = church.my_tenant_id());
+
+-- Attendance Flags Policies
+DROP POLICY IF EXISTS "Pastors can manage their attendance flags" ON church.attendance_flags;
+DROP POLICY IF EXISTS "attendance_flags_rw_select" ON church.attendance_flags;
+DROP POLICY IF EXISTS "attendance_flags_rw_update" ON church.attendance_flags;
+DROP POLICY IF EXISTS "attendance_flags_insert" ON church.attendance_flags;
+DROP POLICY IF EXISTS "attendance_flags_delete" ON church.attendance_flags;
+CREATE POLICY "attendance_flags_rw_select" ON church.attendance_flags FOR SELECT TO authenticated USING (church_id = church.my_tenant_id());
+CREATE POLICY "attendance_flags_rw_update" ON church.attendance_flags FOR UPDATE TO authenticated USING (church_id = church.my_tenant_id()) WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "attendance_flags_insert" ON church.attendance_flags FOR INSERT TO authenticated WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "attendance_flags_delete" ON church.attendance_flags FOR DELETE TO authenticated USING (church_id = church.my_tenant_id());
+
+-- Prayers Policies
+DROP POLICY IF EXISTS "Pastors can manage their prayers" ON church.prayers;
+DROP POLICY IF EXISTS "prayers_rw_select" ON church.prayers;
+DROP POLICY IF EXISTS "prayers_rw_update" ON church.prayers;
+DROP POLICY IF EXISTS "prayers_insert" ON church.prayers;
+DROP POLICY IF EXISTS "prayers_delete" ON church.prayers;
+CREATE POLICY "prayers_rw_select" ON church.prayers FOR SELECT TO authenticated USING (church_id = church.my_tenant_id());
+CREATE POLICY "prayers_rw_update" ON church.prayers FOR UPDATE TO authenticated USING (church_id = church.my_tenant_id()) WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "prayers_insert" ON church.prayers FOR INSERT TO authenticated WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "prayers_delete" ON church.prayers FOR DELETE TO authenticated USING (church_id = church.my_tenant_id());
+
+-- Small Groups Policies
+DROP POLICY IF EXISTS "Pastors can manage their small_groups" ON church.small_groups;
+DROP POLICY IF EXISTS "small_groups_rw_select" ON church.small_groups;
+DROP POLICY IF EXISTS "small_groups_rw_update" ON church.small_groups;
+DROP POLICY IF EXISTS "small_groups_insert" ON church.small_groups;
+DROP POLICY IF EXISTS "small_groups_delete" ON church.small_groups;
+CREATE POLICY "small_groups_rw_select" ON church.small_groups FOR SELECT TO authenticated USING (church_id = church.my_tenant_id());
+CREATE POLICY "small_groups_rw_update" ON church.small_groups FOR UPDATE TO authenticated USING (church_id = church.my_tenant_id()) WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "small_groups_insert" ON church.small_groups FOR INSERT TO authenticated WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "small_groups_delete" ON church.small_groups FOR DELETE TO authenticated USING (church_id = church.my_tenant_id());
+
+-- Donations Policies
+DROP POLICY IF EXISTS "Pastors can manage their donations" ON church.donations;
+DROP POLICY IF EXISTS "donations_rw_select" ON church.donations;
+DROP POLICY IF EXISTS "donations_rw_update" ON church.donations;
+DROP POLICY IF EXISTS "donations_insert" ON church.donations;
+DROP POLICY IF EXISTS "donations_delete" ON church.donations;
+CREATE POLICY "donations_rw_select" ON church.donations FOR SELECT TO authenticated USING (church_id = church.my_tenant_id());
+CREATE POLICY "donations_rw_update" ON church.donations FOR UPDATE TO authenticated USING (church_id = church.my_tenant_id()) WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "donations_insert" ON church.donations FOR INSERT TO authenticated WITH CHECK (church_id = church.my_tenant_id());
+CREATE POLICY "donations_delete" ON church.donations FOR DELETE TO authenticated USING (church_id = church.my_tenant_id());
+
+-- Service Role Bypass for all
+CREATE POLICY "Service role bypass on sms_logs" ON church.sms_logs TO service_role USING (true);
+CREATE POLICY "Service role bypass on wallets" ON public.wallets TO service_role USING (true);
+CREATE POLICY "Service role bypass on wallet_transactions" ON public.wallet_transactions TO service_role USING (true);
+CREATE POLICY "Service role bypass on billing_events" ON public.billing_events TO service_role USING (true);
+CREATE POLICY "Service role bypass on members" ON church.members TO service_role USING (true);
+CREATE POLICY "Service role bypass on new_converts" ON church.new_converts TO service_role USING (true);
+CREATE POLICY "Service role bypass on events" ON church.events TO service_role USING (true);
+CREATE POLICY "Service role bypass on attendance_logs" ON church.attendance_logs TO service_role USING (true);
+CREATE POLICY "Service role bypass on attendance_flags" ON church.attendance_flags TO service_role USING (true);
+CREATE POLICY "Service role bypass on prayers" ON church.prayers TO service_role USING (true);
+CREATE POLICY "Service role bypass on small_groups" ON church.small_groups TO service_role USING (true);
+CREATE POLICY "Service role bypass on donations" ON church.donations TO service_role USING (true);
 
 -- Church Security: Restrict direct SELECT on church.churches to tenant owner / service_role
 DROP POLICY IF EXISTS "Churches are viewable by everyone" ON church.churches;
@@ -907,56 +904,6 @@ CREATE OR REPLACE VIEW public.churches_public WITH (security_invoker = true) AS
 
 GRANT SELECT ON public.churches_public TO anon, authenticated, service_role;
 
--- Additional RLS Policies (using church.my_tenant_id())
-DROP POLICY IF EXISTS "Pastors can manage their attendance logs" ON church.attendance_logs;
-DROP POLICY IF EXISTS "attendance_logs_rw_select" ON church.attendance_logs;
-DROP POLICY IF EXISTS "attendance_logs_rw_update" ON church.attendance_logs;
-DROP POLICY IF EXISTS "attendance_logs_insert" ON church.attendance_logs;
-DROP POLICY IF EXISTS "attendance_logs_delete" ON church.attendance_logs;
-CREATE POLICY "attendance_logs_rw_select"
-  ON church.attendance_logs FOR SELECT
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
-CREATE POLICY "attendance_logs_rw_update"
-  ON church.attendance_logs FOR UPDATE
-  TO authenticated
-  USING (church_id = church.my_tenant_id())
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "attendance_logs_insert"
-  ON church.attendance_logs FOR INSERT
-  TO authenticated
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "attendance_logs_delete"
-  ON church.attendance_logs FOR DELETE
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
-
-DROP POLICY IF EXISTS "Pastors can manage their attendance flags" ON church.attendance_flags;
-DROP POLICY IF EXISTS "attendance_flags_rw_select" ON church.attendance_flags;
-DROP POLICY IF EXISTS "attendance_flags_rw_update" ON church.attendance_flags;
-DROP POLICY IF EXISTS "attendance_flags_insert" ON church.attendance_flags;
-DROP POLICY IF EXISTS "attendance_flags_delete" ON church.attendance_flags;
-CREATE POLICY "attendance_flags_rw_select"
-  ON church.attendance_flags FOR SELECT
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
-CREATE POLICY "attendance_flags_rw_update"
-  ON church.attendance_flags FOR UPDATE
-  TO authenticated
-  USING (church_id = church.my_tenant_id())
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "attendance_flags_insert"
-  ON church.attendance_flags FOR INSERT
-  TO authenticated
-  WITH CHECK (church_id = church.my_tenant_id());
-CREATE POLICY "attendance_flags_delete"
-  ON church.attendance_flags FOR DELETE
-  TO authenticated
-  USING (church_id = church.my_tenant_id());
-
-CREATE POLICY "Service role bypass on attendance_logs" ON church.attendance_logs TO service_role USING (true);
-CREATE POLICY "Service role bypass on attendance_flags" ON church.attendance_flags TO service_role USING (true);
-
 -- RPC Functions for Attendance
 CREATE OR REPLACE FUNCTION church.get_or_create_event(
   p_church_id uuid,
@@ -970,6 +917,7 @@ CREATE OR REPLACE FUNCTION church.get_or_create_event(
 RETURNS church.events
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = church, public, auth
 AS $$
 DECLARE
   v_event church.events;
@@ -1049,6 +997,7 @@ CREATE OR REPLACE FUNCTION church.check_in_member_manual(
 RETURNS church.attendance_logs
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = church, public, auth
 VOLATILE
 AS $$
 DECLARE
@@ -1138,6 +1087,7 @@ CREATE OR REPLACE FUNCTION church.check_in_member_manual_by_date(
 RETURNS church.attendance_logs
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = church, public, auth
 VOLATILE
 AS $$
 DECLARE
@@ -1177,7 +1127,7 @@ BEGIN
   SET attending_count = attending_count + 1
   WHERE id = event_id;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = church, public;
 
 CREATE OR REPLACE FUNCTION church.decrement_event_attendance(event_id uuid)
 RETURNS void AS $$
@@ -1186,7 +1136,7 @@ BEGIN
   SET attending_count = attending_count - 1
   WHERE id = event_id AND attending_count > 0;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = church, public;
 
 CREATE OR REPLACE FUNCTION church.remove_attendance_manual(
   p_member_id uuid,
@@ -1195,6 +1145,7 @@ CREATE OR REPLACE FUNCTION church.remove_attendance_manual(
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = church, public, auth
 AS $$
 DECLARE
   v_church_id uuid;
@@ -1209,112 +1160,81 @@ BEGIN
 END;
 $$;
 
--- Inactivity Detection Function
-CREATE OR REPLACE FUNCTION church.refresh_inactive_30_days(p_church_id uuid DEFAULT NULL)
+-- -- Inactivity Detection Function
+CREATE OR REPLACE FUNCTION church.refresh_inactive_30_days(p_church_id uuid)
 RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = church, public, auth
 AS $$
 DECLARE
   v_now timestamptz := now();
   v_count integer := 0;
 BEGIN
-  IF p_church_id IS NOT NULL THEN
-    IF auth.uid() IS NOT NULL AND p_church_id IS DISTINCT FROM church.my_tenant_id() THEN
-      RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
-    END IF;
+  IF p_church_id IS NULL THEN
+    RAISE EXCEPTION 'Church ID is required';
+  END IF;
 
-    -- Remove existing open flags for this church/type/members that are no longer inactive
-    DELETE FROM church.attendance_flags f
-    USING church.members m
-    WHERE f.church_id = p_church_id
-      AND f.flag_type = 'inactive_30_days'::church.attendance_flag_type
-      AND f.member_id = m.id
-      AND (
-        -- Member has at least one present/late check-in in the last 30 days
-        EXISTS (
-          SELECT 1
-          FROM church.attendance_logs al
-          JOIN church.events e ON e.id = al.event_id
-          WHERE al.member_id = m.id
-            AND al.attendance_status IN ('present','late')
-            AND e.event_date >= (CURRENT_DATE - 30)
-            AND al.church_id = p_church_id
-        )
-      );
+  IF auth.uid() IS NOT NULL AND p_church_id IS DISTINCT FROM church.my_tenant_id() THEN
+    RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
+  END IF;
 
-    -- Insert (or reopen) inactive flags for members who currently have no present/late logs
-    WITH inactive_members AS (
-      SELECT m.id AS member_id, p_church_id AS church_id
-      FROM church.members m
-      WHERE m.church_id = p_church_id
-        AND NOT EXISTS (
-          SELECT 1
-          FROM church.attendance_logs al
-          JOIN church.events e ON e.id = al.event_id
-          WHERE al.member_id = m.id
-            AND al.attendance_status IN ('present','late')
-            AND e.event_date >= (CURRENT_DATE - 30)
-            AND al.church_id = p_church_id
-        )
-    )
-    INSERT INTO church.attendance_flags (id, church_id, member_id, flag_type, status, created_at)
-    SELECT gen_random_uuid(), im.church_id, im.member_id,
-           'inactive_30_days'::church.attendance_flag_type,
-           'open'::church.attendance_flag_status,
-           v_now
-    FROM inactive_members im
-    WHERE NOT EXISTS (
-      SELECT 1
-      FROM church.attendance_flags f
-      WHERE f.church_id = im.church_id
-        AND f.member_id = im.member_id
-        AND f.flag_type = 'inactive_30_days'::church.attendance_flag_type
-        AND f.status = 'open'::church.attendance_flag_status
-    );
-
-    GET DIAGNOSTICS v_count = ROW_COUNT;
-    RETURN v_count;
-  ELSE
-    -- Run for all churches
-    WITH inactive_members AS (
-      SELECT m.church_id AS church_id, m.id AS member_id
-      FROM church.members m
-      WHERE NOT EXISTS (
+  -- Remove existing open flags for this church/type/members that are no longer inactive
+  DELETE FROM church.attendance_flags f
+  USING church.members m
+  WHERE f.church_id = p_church_id
+    AND f.flag_type = 'inactive_30_days'::church.attendance_flag_type
+    AND f.member_id = m.id
+    AND (
+      -- Member has at least one present/late check-in in the last 30 days
+      EXISTS (
         SELECT 1
         FROM church.attendance_logs al
         JOIN church.events e ON e.id = al.event_id
         WHERE al.member_id = m.id
           AND al.attendance_status IN ('present','late')
           AND e.event_date >= (CURRENT_DATE - 30)
-          AND al.church_id = m.church_id
+          AND al.church_id = p_church_id
       )
-    )
-    INSERT INTO church.attendance_flags (id, church_id, member_id, flag_type, status, created_at)
-    SELECT gen_random_uuid(), im.church_id, im.member_id,
-           'inactive_30_days'::church.attendance_flag_type,
-           'open'::church.attendance_flag_status,
-           v_now
-    FROM inactive_members im
-    WHERE NOT EXISTS (
-      SELECT 1
-      FROM church.attendance_flags f
-      WHERE f.church_id = im.church_id
-        AND f.member_id = im.member_id
-        AND f.flag_type = 'inactive_30_days'::church.attendance_flag_type
-        AND f.status = 'open'::church.attendance_flag_status
     );
 
-    GET DIAGNOSTICS v_count = ROW_COUNT;
-    RETURN v_count;
-  END IF;
+  -- Insert (or reopen) inactive flags for members who currently have no present/late logs
+  WITH inactive_members AS (
+    SELECT m.id AS member_id, p_church_id AS church_id
+    FROM church.members m
+    WHERE m.church_id = p_church_id
+      AND NOT EXISTS (
+        SELECT 1
+        FROM church.attendance_logs al
+        JOIN church.events e ON e.id = al.event_id
+        WHERE al.member_id = m.id
+          AND al.attendance_status IN ('present','late')
+          AND e.event_date >= (CURRENT_DATE - 30)
+          AND al.church_id = p_church_id
+      )
+  )
+  INSERT INTO church.attendance_flags (id, church_id, member_id, flag_type, status, created_at)
+  SELECT gen_random_uuid(), im.church_id, im.member_id,
+         'inactive_30_days'::church.attendance_flag_type,
+         'open'::church.attendance_flag_status,
+         v_now
+  FROM inactive_members im
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM church.attendance_flags f
+    WHERE f.church_id = im.church_id
+      AND f.member_id = im.member_id
+      AND f.flag_type = 'inactive_30_days'::church.attendance_flag_type
+      AND f.status = 'open'::church.attendance_flag_status
+  );
+
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count;
 END;
 $$;
 
-REVOKE EXECUTE ON FUNCTION church.process_inactive_30_days(uuid) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION church.process_inactive_30_days(uuid) TO service_role;
-REVOKE EXECUTE ON FUNCTION church.refresh_inactive_30_days(uuid) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION church.refresh_inactive_30_days(uuid) TO service_role;
+REVOKE EXECUTE ON FUNCTION church.refresh_inactive_30_days(uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION church.refresh_inactive_30_days(uuid) TO authenticated, service_role;
 
 -- Usher Passkey Validation
 CREATE OR REPLACE FUNCTION church.validate_usher_passkey(
@@ -1328,6 +1248,7 @@ RETURNS TABLE (
 ) 
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = church, public
 AS $$
 BEGIN
   RETURN QUERY
@@ -1351,6 +1272,7 @@ RETURNS TABLE (
 ) 
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = church, public
 AS $$
 BEGIN
   RETURN QUERY SELECT * FROM church.validate_usher_passkey(p_church_slug, p_passkey);
@@ -1361,32 +1283,38 @@ REVOKE EXECUTE ON FUNCTION church.validate_usher_passkey(text, text) FROM PUBLIC
 GRANT EXECUTE ON FUNCTION church.validate_usher_passkey(text, text) TO service_role;
 REVOKE EXECUTE ON FUNCTION public.validate_usher_passkey(text, text) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.validate_usher_passkey(text, text) TO service_role;
-REVOKE EXECUTE ON FUNCTION church.get_or_create_event(uuid, church.event_service_type, date, time, text, text, uuid) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION church.get_or_create_event(uuid, church.event_service_type, date, time, text, text, uuid) TO service_role;
-REVOKE EXECUTE ON FUNCTION church.check_in_member_manual(uuid, uuid, church.attendance_status, timestamptz, text, uuid) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION church.check_in_member_manual(uuid, uuid, church.attendance_status, timestamptz, text, uuid) TO service_role;
-REVOKE EXECUTE ON FUNCTION church.check_in_member_manual_by_date(uuid, church.event_service_type, date, uuid, church.attendance_status, timestamptz, text) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION church.check_in_member_manual_by_date(uuid, church.event_service_type, date, uuid, church.attendance_status, timestamptz, text) TO service_role;
-REVOKE EXECUTE ON FUNCTION church.increment_event_attendance(uuid) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION church.increment_event_attendance(uuid) TO service_role;
-REVOKE EXECUTE ON FUNCTION church.decrement_event_attendance(uuid) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION church.decrement_event_attendance(uuid) TO service_role;
-REVOKE EXECUTE ON FUNCTION church.remove_attendance_manual(uuid, uuid) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION church.remove_attendance_manual(uuid, uuid) TO service_role;
+REVOKE EXECUTE ON FUNCTION church.get_or_create_event(uuid, church.event_service_type, date, time, text, text, uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION church.get_or_create_event(uuid, church.event_service_type, date, time, text, text, uuid) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION church.check_in_member_manual(uuid, uuid, church.attendance_status, timestamptz, text, uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION church.check_in_member_manual(uuid, uuid, church.attendance_status, timestamptz, text, uuid) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION church.check_in_member_manual_by_date(uuid, church.event_service_type, date, uuid, church.attendance_status, timestamptz, text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION church.check_in_member_manual_by_date(uuid, church.event_service_type, date, uuid, church.attendance_status, timestamptz, text) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION church.increment_event_attendance(uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION church.increment_event_attendance(uuid) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION church.decrement_event_attendance(uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION church.decrement_event_attendance(uuid) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION church.remove_attendance_manual(uuid, uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION church.remove_attendance_manual(uuid, uuid) TO authenticated, service_role;
 
 -- Follow-up Processor for Inactivity
-CREATE OR REPLACE FUNCTION church.process_inactive_30_days_followups(p_church_id uuid DEFAULT NULL)
+CREATE OR REPLACE FUNCTION church.process_inactive_30_days_followups(p_church_id uuid)
 RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = church, public, auth
 AS $$
 DECLARE
   v_now timestamptz := now();
   v_count integer := 0;
 BEGIN
-  IF p_church_id IS NOT NULL AND auth.uid() IS NOT NULL AND p_church_id IS DISTINCT FROM church.my_tenant_id() THEN
+  IF p_church_id IS NULL THEN
+    RAISE EXCEPTION 'Church ID is required';
+  END IF;
+
+  IF auth.uid() IS NOT NULL AND p_church_id IS DISTINCT FROM church.my_tenant_id() THEN
     RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
   END IF;
+
   -- 1) Resolve any followed_up/open that has returned (present/late in last 30 days)
   WITH returned AS (
     SELECT DISTINCT al.church_id, al.member_id
@@ -1394,12 +1322,13 @@ BEGIN
     JOIN church.events e ON e.id = al.event_id
     WHERE al.attendance_status IN ('present','late')
       AND e.event_date >= (CURRENT_DATE - 30)
-      AND (p_church_id IS NULL OR al.church_id = p_church_id)
+      AND al.church_id = p_church_id
   )
   UPDATE church.attendance_flags f
   SET status = 'resolved'::church.attendance_flag_status
   WHERE f.flag_type = 'inactive_30_days'::church.attendance_flag_type
     AND f.status IN ('open'::church.attendance_flag_status,'followed_up'::church.attendance_flag_status)
+    AND f.church_id = p_church_id
     AND EXISTS (
       SELECT 1 FROM returned r
       WHERE r.church_id = f.church_id
@@ -1413,7 +1342,7 @@ BEGIN
     WHERE f.flag_type = 'inactive_30_days'::church.attendance_flag_type
       AND f.status = 'open'::church.attendance_flag_status
       AND f.created_at <= (v_now - interval '7 days')
-      AND (p_church_id IS NULL OR f.church_id = p_church_id)
+      AND f.church_id = p_church_id
       AND NOT EXISTS (
         SELECT 1
         FROM church.attendance_logs al
@@ -1435,7 +1364,7 @@ BEGIN
     WHERE f.flag_type = 'inactive_30_days'::church.attendance_flag_type
       AND f.status = 'followed_up'::church.attendance_flag_status
       AND f.created_at <= (v_now - interval '14 days')
-      AND (p_church_id IS NULL OR f.church_id = p_church_id)
+      AND f.church_id = p_church_id
   )
   UPDATE church.attendance_flags f
   SET status = 'resolved'::church.attendance_flag_status
@@ -1446,7 +1375,7 @@ BEGIN
   FROM church.attendance_flags f
   WHERE f.flag_type = 'inactive_30_days'::church.attendance_flag_type
     AND f.status <> 'resolved'::church.attendance_flag_status
-    AND (p_church_id IS NULL OR f.church_id = p_church_id);
+    AND f.church_id = p_church_id;
 
   RETURN v_count;
 END;
@@ -1585,14 +1514,14 @@ $$;
 REVOKE EXECUTE ON FUNCTION church.claim_sms_queue_batch(uuid, int) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION church.claim_sms_queue_batch(uuid, int) TO service_role;
 
--- Process Topup Webhook RPC
+-- Process Topup Webhook RPC (MT-10)
 CREATE OR REPLACE FUNCTION public.process_topup_webhook(
   p_reference text,
   p_tenant_id uuid,
   p_amount bigint,
   p_payload jsonb DEFAULT '{}'::jsonb
 )
-RETURNS boolean
+RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
@@ -1612,11 +1541,11 @@ BEGIN
   FOR UPDATE;
 
   IF v_tx_id IS NULL THEN
-    RETURN false;
+    RETURN jsonb_build_object('result', 'not_found');
   END IF;
 
   IF v_current_status = 'success' THEN
-    RETURN true;
+    RETURN jsonb_build_object('result', 'duplicate');
   END IF;
 
   UPDATE public.wallet_transactions
@@ -1629,10 +1558,55 @@ BEGIN
       last_updated = now()
   WHERE tenant_id = p_tenant_id;
 
-  RETURN true;
+  RETURN jsonb_build_object('result', 'credited');
 END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION public.process_topup_webhook(text, uuid, bigint, jsonb) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.process_topup_webhook(text, uuid, bigint, jsonb) TO service_role;
+
+-- 13. Platform Admins, Business Idempotency, and Usher Sessions RLS Hardening
+CREATE SCHEMA IF NOT EXISTS business;
+
+CREATE TABLE IF NOT EXISTS business.platform_admins (
+  id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  email text,
+  full_name text,
+  created_at timestamptz DEFAULT now()
+);
+
+ALTER TABLE business.platform_admins ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Platform admins view self" ON business.platform_admins;
+CREATE POLICY "Platform admins view self" ON business.platform_admins FOR SELECT TO authenticated USING (id = auth.uid());
+DROP POLICY IF EXISTS "Service role full access on platform_admins" ON business.platform_admins;
+CREATE POLICY "Service role full access on platform_admins" ON business.platform_admins FOR ALL TO service_role USING (true);
+
+CREATE TABLE IF NOT EXISTS business.idempotency_keys (
+  key text PRIMARY KEY,
+  mfi_id uuid,
+  response jsonb,
+  created_at timestamptz DEFAULT now()
+);
+
+ALTER TABLE business.idempotency_keys ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users access own mfi keys" ON business.idempotency_keys;
+CREATE POLICY "Users access own mfi keys" ON business.idempotency_keys FOR ALL TO authenticated USING (mfi_id = church.my_tenant_id());
+DROP POLICY IF EXISTS "Service role full access on idempotency_keys" ON business.idempotency_keys;
+CREATE POLICY "Service role full access on idempotency_keys" ON business.idempotency_keys FOR ALL TO service_role USING (true);
+
+CREATE TABLE IF NOT EXISTS church.usher_sessions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
+  passkey_hash text NOT NULL,
+  passkey_version int DEFAULT 1,
+  created_at timestamptz DEFAULT now(),
+  expires_at timestamptz DEFAULT (now() + interval '24 hours')
+);
+
+ALTER TABLE church.usher_sessions ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Pastors can view usher sessions" ON church.usher_sessions;
+CREATE POLICY "Pastors can view usher sessions" ON church.usher_sessions FOR SELECT TO authenticated USING (church_id = church.my_tenant_id());
+DROP POLICY IF EXISTS "Service role full access on usher_sessions" ON church.usher_sessions;
+CREATE POLICY "Service role full access on usher_sessions" ON church.usher_sessions FOR ALL TO service_role USING (true);
+
 

@@ -1,5 +1,4 @@
-import { getChurchBySlug } from '@/lib/db';
-import { createAdminClient } from '@/lib/supabase/server';
+import { requireTenant } from '@/lib/tenant';
 import { AdminCharts } from '@/components/AdminCharts';
 import DashboardGreeting from '@/components/DashboardGreeting';
 
@@ -9,19 +8,12 @@ export default async function AdminDashboard({
   params: Promise<{ church_slug: string }>;
 }) {
   const resolvedParams = await params;
-  const church = await getChurchBySlug(resolvedParams.church_slug) || {
-    id: 'unknown',
-    name: resolvedParams.church_slug,
-    slug: resolvedParams.church_slug,
-    themeColor: 'bg-slate-90',
-    logoUrl: `https://picsum.photos/seed/${resolvedParams.church_slug}/200/200`
-  };
-
-  const supabase = await createAdminClient();
+  
+  // Enforce tenant authorization and verified context (MT-09)
+  const { church, user, supabase } = await requireTenant(resolvedParams.church_slug);
 
   // Optimized Parallel Data Fetching
-  const [userResult, memberCountResult, recentMembersResult, eventsResult, prayersResult, demographicsResult, convertsResult, donationsResult, lastMonthMembersResult, recentAttendanceResult, memberGrowthResult, allLogsResult, visitorCountResult, lastMonthVisitorsResult, recentVisitorsResult] = await Promise.all([
-    supabase.auth.getUser(),
+  const [memberCountResult, recentMembersResult, eventsResult, prayersResult, demographicsResult, convertsResult, donationsResult, lastMonthMembersResult, recentAttendanceResult, memberGrowthResult, allLogsResult, visitorCountResult, lastMonthVisitorsResult, recentVisitorsResult] = await Promise.all([
     supabase.schema('church').from('members').select('id', { count: 'exact', head: true }).eq('church_id', church.id),
     supabase.schema('church').from('members').select('full_name, created_at').eq('church_id', church.id).order('created_at', { ascending: false }).limit(5),
     supabase.schema('church').from('events').select('*').eq('church_id', church.id).order('event_date', { ascending: false }).limit(10),
@@ -38,7 +30,6 @@ export default async function AdminDashboard({
     supabase.schema('church').from('visitors').select('full_name, created_at, visitor_type').eq('church_id', church.id).order('created_at', { ascending: false }).limit(5)
   ]);
 
-  const { data: { user } } = userResult;
   const pastorName = user?.user_metadata?.full_name || 
                      user?.user_metadata?.name || 
                      user?.email?.split('@')[0].split('.').map((s: string) => s.charAt(0).toUpperCase() + s.slice(1)).join(' ') || 

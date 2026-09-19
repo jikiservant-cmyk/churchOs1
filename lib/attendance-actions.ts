@@ -19,6 +19,11 @@ function getJwtSecret(): Uint8Array {
   return derivedSecret;
 }
 
+function computePasskeyHash(passkey: string): string {
+  const secret = getJwtSecret();
+  return crypto.createHmac('sha256', secret).update(passkey.trim()).digest('hex');
+}
+
 // In-memory throttling map to prevent brute-force attacks on usher passkeys (max 5 failed attempts per 60s)
 const failedAttemptsMap = new Map<string, { count: number; resetTime: number }>();
 
@@ -49,6 +54,16 @@ function resetUsherAttempts(key: string) {
   failedAttemptsMap.delete(key);
 }
 
+export async function generateSecurePasskey(): Promise<string> {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(8);
+  let result = '';
+  for (let i = 0; i < 8; i++) {
+    result += chars[bytes[i] % chars.length];
+  }
+  return result;
+}
+
 export async function validateUsherPasskey(churchSlug: string, passkey: string) {
   try {
     // Canonicalize slug to prevent % wildcards and case variations from resetting throttle buckets
@@ -72,7 +87,7 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
     const { data: church } = await supabase
       .schema('church')
       .from('churches')
-      .select('id, name, passkey')
+      .select('id, name, passkey, passkey_hash, passkey_version')
       .eq('slug', canonicalSlug)
       .maybeSingle();
 
@@ -81,22 +96,40 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
       return { success: false, error: 'Church not found.' };
     }
 
-    const expectedPasskey = (church.passkey || '').trim();
-    if (!expectedPasskey || expectedPasskey.length < 4) {
-      console.error('[validateUsherPasskey] church has no usable passkey configured');
-      return { success: false, error: 'Usher portal is not configured for this church.' };
-    }
-
     const providedPasskey = (passkey || '').trim();
     if (!providedPasskey || providedPasskey.length < 4) {
       recordUsherFailedAttempt(canonicalSlug);
       return { success: false, error: 'Invalid passkey. Passkey must be at least 4 characters.' };
     }
-    
-    // Constant-time comparison to prevent timing side channels
-    const expectedBuf = Buffer.from(expectedPasskey);
-    const providedBuf = Buffer.from(providedPasskey);
-    const isMatch = expectedBuf.length === providedBuf.length && crypto.timingSafeEqual(expectedBuf, providedBuf);
+
+    const providedHash = computePasskeyHash(providedPasskey);
+    let isMatch = false;
+
+    if (church.passkey_hash) {
+      // Timing-safe comparison of cryptographic hash
+      const expectedBuf = Buffer.from(church.passkey_hash, 'hex');
+      const actualBuf = Buffer.from(providedHash, 'hex');
+      if (expectedBuf.length === actualBuf.length && crypto.timingSafeEqual(expectedBuf, actualBuf)) {
+        isMatch = true;
+      }
+    } else if (church.passkey) {
+      // Legacy plaintext timing-safe fallback and transparent migration to hash
+      const expectedBuf = Buffer.from((church.passkey || '').trim());
+      const actualBuf = Buffer.from(providedPasskey);
+      if (expectedBuf.length === actualBuf.length && crypto.timingSafeEqual(expectedBuf, actualBuf)) {
+        isMatch = true;
+        // Upgrade database to store passkey_hash
+        supabase
+          .schema('church')
+          .from('churches')
+          .update({
+            passkey_hash: providedHash,
+            passkey_version: church.passkey_version || 1
+          })
+          .eq('id', church.id)
+          .then();
+      }
+    }
 
     if (!isMatch) {
       recordUsherFailedAttempt(canonicalSlug);
@@ -108,13 +141,15 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
 
     const churchId = church.id;
     const churchName = church.name;
+    const currentVersion = church.passkey_version || 1;
 
-    // 2. Create a cryptographically signed JWT for the session
+    // 2. Create a cryptographically signed JWT for the session bound to passkey_version
     const token = await new SignJWT({
       church_id: churchId,
       church_name: churchName,
       church_slug: canonicalSlug,
-      role: 'usher'
+      role: 'usher',
+      passkey_version: currentVersion
     })
       .setProtectedHeader({ alg: 'HS256' })
       .setIssuedAt()
@@ -157,9 +192,30 @@ export async function getUsherSession(churchSlug: string) {
   try {
     const { payload } = await jwtVerify(token, getJwtSecret());
     // Ensure the token's church_slug strictly matches the requested church URL slug
-    if (payload.church_slug !== canonicalSlug) {
+    if (payload.church_slug !== canonicalSlug || payload.role !== 'usher' || !payload.church_id) {
       return null;
     }
+
+    // MT-01 & MT-02 remediation: Re-bind session to database record to ensure passkey has not been rotated
+    const adminClient = await createAdminClient();
+    const { data: church } = await adminClient
+      .schema('church')
+      .from('churches')
+      .select('id, slug, passkey_version')
+      .eq('id', payload.church_id as string)
+      .maybeSingle();
+
+    if (!church || church.slug !== canonicalSlug) {
+      return null;
+    }
+
+    const currentVersion = church.passkey_version || 1;
+    const sessionVersion = (payload.passkey_version as number) || 1;
+    if (sessionVersion !== currentVersion) {
+      // Passkey was rotated; previous usher sessions are revoked immediately
+      return null;
+    }
+
     return payload as any;
   } catch (e) {
     return null;
@@ -182,15 +238,15 @@ export async function createEvent(formData: FormData, churchId: string, churchSl
     return { error: 'You must be logged in to create services.' };
   }
 
-  // Verify caller's admin profile belongs to this church
+  // Verify caller's admin profile belongs to this church and has pastor or admin role (MT-04)
   const { data: profile } = await supabase
     .from('admin_profiles')
     .select('tenant_id, role')
     .eq('id', user.id)
     .maybeSingle();
 
-  if (!profile || profile.tenant_id !== churchId) {
-    return { error: 'Unauthorized: you do not have permission to manage events for this church.' };
+  if (!profile || profile.tenant_id !== churchId || !['pastor', 'admin'].includes(profile.role)) {
+    return { error: 'Unauthorized: only pastors or administrators have permission to manage events for this church.' };
   }
 
   const name = formData.get('name') as string;
@@ -288,21 +344,45 @@ export async function updateChurchPasskey(churchId: string, newPasskey: string, 
     
     if (!user) return { error: 'Not authenticated' };
 
-    // Verify Admin Access
+    // Verify Admin Access with strict role check (MT-04)
     const { data: profile } = await supabase
       .from('admin_profiles')
-      .select('tenant_id')
+      .select('tenant_id, role')
       .eq('id', user.id)
       .eq('tenant_id', churchId)
       .maybeSingle();
 
-    if (!profile) return { error: 'Access denied' };
+    if (!profile || !['pastor', 'admin'].includes(profile.role)) {
+      return { error: 'Access denied: Only pastors or administrators can rotate the usher passkey.' };
+    }
 
+    const trimmedKey = newPasskey.trim();
+    if (trimmedKey.length < 4) {
+      return { error: 'Passkey must be at least 4 characters long.' };
+    }
+
+    const passkeyHash = computePasskeyHash(trimmedKey);
     const adminSupabase = await createAdminClient();
+
+    const { data: church } = await adminSupabase
+      .schema('church')
+      .from('churches')
+      .select('passkey_version')
+      .eq('id', churchId)
+      .maybeSingle();
+
+    const nextVersion = (church?.passkey_version || 1) + 1;
+
+    // MT-01 & MT-02 remediation: store hash, bump version to invalidate existing usher JWT sessions immediately
     const { error } = await adminSupabase
       .schema('church')
       .from('churches')
-      .update({ passkey: newPasskey })
+      .update({
+        passkey: trimmedKey,
+        passkey_hash: passkeyHash,
+        passkey_version: nextVersion,
+        passkey_updated_at: new Date().toISOString()
+      })
       .eq('id', churchId);
 
     if (error) {
@@ -311,6 +391,7 @@ export async function updateChurchPasskey(churchId: string, newPasskey: string, 
     }
 
     revalidatePath(`/${churchSlug}/admin/attendance`);
+    revalidatePath(`/${churchSlug}/usher/dashboard`);
     return { success: true };
   } catch (error) {
     console.error('[updateChurchPasskey] Unexpected error:', error);
@@ -355,7 +436,11 @@ export async function getEventAttendanceData(churchSlug: string, eventId: string
   }
 }
 
-async function checkAuthorization(churchSlug: string, eventId: string) {
+async function checkAuthorization(
+  churchSlug: string,
+  eventId: string,
+  allowedRoles: ('pastor' | 'admin' | 'staff' | 'usher')[] = ['pastor', 'admin', 'usher']
+) {
   const adminClient = await createAdminClient();
   const { data: event } = await adminClient.schema('church').from('events').select('church_id').eq('id', eventId).single();
   
@@ -364,22 +449,28 @@ async function checkAuthorization(churchSlug: string, eventId: string) {
   }
   
   // 1. Is there an usher session for this church?
-  // We use ilike or normalize to lowercase to match the cookie name logic
-  const usherSession = await getUsherSession(churchSlug.toLowerCase());
-  if (usherSession && usherSession.church_slug === churchSlug.toLowerCase() && usherSession.church_id === event.church_id) {
-    return { adminClient, allowed: true };
+  if (allowedRoles.includes('usher')) {
+    const usherSession = await getUsherSession(churchSlug.toLowerCase());
+    if (usherSession && usherSession.church_slug === churchSlug.toLowerCase() && usherSession.church_id === event.church_id) {
+      return { adminClient, allowed: true, role: 'usher' };
+    }
   }
 
-  // 2. Is there a logged-in admin for this church?
+  // 2. Is there a logged-in admin for this church with allowed role?
   const client = await createClient();
   const { data: { user } } = await client.auth.getUser();
 
   if (user) {
-      const { data: profile } = await adminClient.from('admin_profiles').select('tenant_id').eq('id', user.id).maybeSingle();
-      if (profile && profile.tenant_id === event.church_id) {
-         return { adminClient, allowed: true };
-      }
+    const { data: profile } = await adminClient
+      .from('admin_profiles')
+      .select('tenant_id, role')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (profile && profile.tenant_id === event.church_id && allowedRoles.includes(profile.role)) {
+      return { adminClient, allowed: true, role: profile.role };
     }
+  }
 
   throw new Error('Unauthorized to modify this event.');
 }

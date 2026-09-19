@@ -1,4 +1,4 @@
-import { createAdminClient } from '@/lib/supabase/server';
+import { requireTenant } from '@/lib/tenant';
 import { UserCheck, Plus } from 'lucide-react';
 import { addVisitor, bulkAddVisitors } from './actions';
 import CSVUploader from '@/components/CSVUploader';
@@ -15,20 +15,15 @@ export default async function VisitorsPage(props: {
 }) {
   const resolvedParams = await props.params;
   const searchParams = await props.searchParams;
-  const supabase = await createAdminClient();
-
-  const { data: church, error: churchError } = await supabase
-    .schema('church')
-    .from('churches')
-    .select('id')
-    .eq('slug', resolvedParams.church_slug)
-    .maybeSingle();
+  
+  // Enforce tenant authorization and verified context (MT-09)
+  const { church, supabase } = await requireTenant(resolvedParams.church_slug);
 
   let query = supabase
     .schema('church')
     .from('visitors')
     .select('*')
-    .eq('church_id', church?.id || '00000000-0000-0000-0000-000000000000');
+    .eq('church_id', church.id);
 
   if (searchParams.q) {
     query = query.ilike('full_name', `%${searchParams.q}%`);

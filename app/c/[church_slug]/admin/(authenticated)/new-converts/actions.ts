@@ -99,7 +99,7 @@ export async function editNewConvert(formData: FormData) {
   let searchParams = '';
 
   try {
-    const { supabase } = await checkChurchAdminAuth(churchSlug);
+    const { supabase, churchId: finalChurchId } = await checkChurchAdminAuth(churchSlug);
 
     const payload = {
       name,
@@ -110,7 +110,8 @@ export async function editNewConvert(formData: FormData) {
       .schema('church')
       .from('new_converts')
       .update(payload)
-      .eq('id', convertId);
+      .eq('id', convertId)
+      .eq('church_id', finalChurchId);
 
     if (error) {
       console.error('Error updating new convert:', error);

@@ -149,7 +149,16 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Payment processing failed, please retry' }, { status: 500 });
   }
 
-  switch (result?.result) {
+  // Normalize result if it is returned as an object, boolean, or string (MT-10)
+  const normalizedResult = typeof result === 'string'
+    ? result
+    : typeof result === 'object' && result !== null && 'result' in result
+      ? (result as { result: string }).result
+      : result === true
+        ? 'credited'
+        : 'unexpected';
+
+  switch (normalizedResult) {
     case 'credited':
       revalidatePath('/', 'layout');
       console.log(

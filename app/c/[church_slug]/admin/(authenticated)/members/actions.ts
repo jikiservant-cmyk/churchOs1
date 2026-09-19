@@ -143,7 +143,8 @@ export async function editMember(formData: FormData) {
       .schema('church')
       .from('members')
       .update(payload)
-      .eq('id', memberId);
+      .eq('id', memberId)
+      .eq('church_id', finalChurchId);
 
     if (error) {
       console.error('Error updating member:', error);

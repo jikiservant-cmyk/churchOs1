@@ -2,7 +2,10 @@ import { getChurchBySlug } from '@/lib/db';
 import { createClient } from '@/lib/supabase/server';
 import { redirect, notFound } from 'next/navigation';
 
-export async function requireTenant(churchSlug: string) {
+export async function requireTenant(
+  churchSlug: string,
+  allowedRoles: ('pastor' | 'admin' | 'staff')[] = ['pastor', 'admin']
+) {
   const church = await getChurchBySlug(churchSlug);
   if (!church) {
     notFound();
@@ -21,7 +24,7 @@ export async function requireTenant(churchSlug: string) {
     .eq('id', user.id)
     .maybeSingle();
 
-  if (!profile || profile.role !== 'pastor' || !profile.tenant_id) {
+  if (!profile || !profile.tenant_id || !allowedRoles.includes(profile.role)) {
     redirect(`/?error=Access Denied`);
   }
 
@@ -43,7 +46,10 @@ export async function requireTenant(churchSlug: string) {
   return { church, user, profile, supabase };
 }
 
-export async function assertChurchAdminAuth(churchSlug: string) {
+export async function assertChurchAdminAuth(
+  churchSlug: string,
+  allowedRoles: ('pastor' | 'admin' | 'staff')[] = ['pastor', 'admin']
+) {
   const canonical = churchSlug.toLowerCase().trim();
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(canonical)) {
     throw new Error('Invalid church identifier');
@@ -62,9 +68,46 @@ export async function assertChurchAdminAuth(churchSlug: string) {
     .eq('id', user.id)
     .maybeSingle();
 
-  if (!profile || profile.tenant_id !== church.id) {
-    throw new Error('Unauthorized to perform this action for this church');
+  if (!profile || profile.tenant_id !== church.id || !allowedRoles.includes(profile.role)) {
+    throw new Error(`Unauthorized: Insufficient permissions for church ${canonical}`);
   }
 
-  return { supabase, user, church, churchId: church.id };
+  return { supabase, user, church, churchId: church.id, role: profile.role };
+}
+
+export async function assertTenantRole(
+  churchSlugOrId: string,
+  allowedRoles: ('pastor' | 'admin' | 'staff')[] = ['pastor', 'admin']
+) {
+  const supabase = await createClient();
+  const { data: { user }, error: authError } = await supabase.auth.getUser();
+  if (authError || !user) throw new Error('Unauthenticated');
+
+  const { data: profile } = await supabase
+    .from('admin_profiles')
+    .select('role, tenant_id')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  if (!profile || !profile.tenant_id) {
+    throw new Error('No tenant profile found');
+  }
+
+  if (!allowedRoles.includes(profile.role)) {
+    throw new Error(`Forbidden: Role '${profile.role}' is not permitted for this operation`);
+  }
+
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(churchSlugOrId);
+  if (isUuid) {
+    if (profile.tenant_id !== churchSlugOrId) {
+      throw new Error('Tenant mismatch');
+    }
+  } else {
+    const church = await getChurchBySlug(churchSlugOrId);
+    if (!church || profile.tenant_id !== church.id) {
+      throw new Error('Tenant mismatch');
+    }
+  }
+
+  return { user, profile, tenantId: profile.tenant_id };
 }

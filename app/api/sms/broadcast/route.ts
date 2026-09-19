@@ -4,9 +4,9 @@ import { sendSingleSMS } from '@/lib/sms-actions';
 
 export async function POST(req: Request) {
   const encoder = new TextEncoder();
-  const { message, churchId, recipients } = await req.json();
+  const { message, churchId, recipients, recipientIds } = await req.json();
 
-  if (!message || !churchId || !recipients || !Array.isArray(recipients)) {
+  if (!message || !churchId || (!Array.isArray(recipients) && !Array.isArray(recipientIds))) {
     return NextResponse.json({ error: 'Missing message, churchId, or recipients' }, { status: 400 });
   }
 
@@ -19,7 +19,7 @@ export async function POST(req: Request) {
       try {
         const supabase = await createClient();
         
-        // 1. Verify Auth & Admin Status
+        // 1. Verify Auth & Admin Role Status (MT-04)
         const { data: { user }, error: authError } = await supabase.auth.getUser();
         if (authError || !user) {
           sendUpdate({ type: 'fatal', error: 'Unauthorized' });
@@ -29,13 +29,60 @@ export async function POST(req: Request) {
 
         const { data: adminProfile } = await supabase
           .from('admin_profiles')
-          .select('tenant_id')
+          .select('tenant_id, role')
           .eq('id', user.id)
           .eq('tenant_id', churchId)
           .maybeSingle();
 
-        if (!adminProfile) {
-          sendUpdate({ type: 'fatal', error: 'Forbidden' });
+        if (!adminProfile || !['pastor', 'admin'].includes(adminProfile.role)) {
+          sendUpdate({ type: 'fatal', error: 'Forbidden: Insufficient privileges to broadcast SMS' });
+          controller.close();
+          return;
+        }
+
+        // MT-06 remediation: Query and verify all recipients server-side strictly scoped to this tenant
+        const requestedIds = Array.isArray(recipientIds)
+          ? recipientIds
+          : Array.isArray(recipients) ? recipients.map((r: any) => r.id).filter(Boolean) : [];
+
+        let verifiedRecipients: Array<{ id: string; full_name: string; phone_number: string }> = [];
+
+        if (requestedIds.length > 0) {
+          const [membersRes, convertsRes] = await Promise.all([
+            supabase
+              .schema('church')
+              .from('members')
+              .select('id, full_name, phone_number')
+              .eq('church_id', churchId)
+              .in('id', requestedIds),
+            supabase
+              .schema('church')
+              .from('new_converts')
+              .select('id, full_name, phone_number')
+              .eq('church_id', churchId)
+              .in('id', requestedIds)
+          ]);
+
+          const memberRecipients = (membersRes.data || []).map(m => ({
+            id: m.id,
+            full_name: m.full_name,
+            phone_number: m.phone_number
+          }));
+
+          const convertRecipients = (convertsRes.data || []).map(c => ({
+            id: c.id,
+            full_name: c.full_name,
+            phone_number: c.phone_number
+          }));
+
+          verifiedRecipients = [...memberRecipients, ...convertRecipients];
+        }
+
+        // Exclude empty or invalid phone numbers
+        verifiedRecipients = verifiedRecipients.filter(r => r.phone_number && r.phone_number.trim().length > 5);
+
+        if (verifiedRecipients.length === 0) {
+          sendUpdate({ type: 'fatal', error: 'No authorized recipients found for this church.' });
           controller.close();
           return;
         }

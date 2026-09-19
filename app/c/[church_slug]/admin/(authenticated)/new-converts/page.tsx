@@ -1,4 +1,4 @@
-import { createAdminClient } from '@/lib/supabase/server';
+import { requireTenant } from '@/lib/tenant';
 import { UserPlus, Plus, MoreVertical, Pencil } from 'lucide-react';
 import { addNewConvert, bulkAddNewConverts } from './actions';
 import CSVUploader from '@/components/CSVUploader';
@@ -16,20 +16,15 @@ export default async function NewConvertsPage(props: {
   const resolvedParams = await props.params;
   const searchParams = await props.searchParams;
   const Object_slug = resolvedParams.church_slug;
-  const supabase = await createAdminClient();
-
-  const { data: church } = await supabase
-    .schema('church')
-    .from('churches')
-    .select('id')
-    .eq('slug', Object_slug)
-    .maybeSingle();
+  
+  // Enforce tenant authorization and verified context (MT-09)
+  const { church, supabase } = await requireTenant(Object_slug);
 
   let query = supabase
     .schema('church')
     .from('new_converts')
     .select('*')
-    .eq('church_id', church?.id || '00000000-0000-0000-0000-000000000000');
+    .eq('church_id', church.id);
 
   if (searchParams.q) {
     query = query.ilike('name', `%${searchParams.q}%`);

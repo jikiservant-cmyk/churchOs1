@@ -18,11 +18,13 @@ export function PasskeyManager({
   const [isSuccess, setIsSuccess] = useState(false);
 
   const generatePasskey = () => {
-    // Generate a 6-character random uppercase alphanumeric string
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Removed confusing chars like 0, O, I, 1
+    // Generate a high-entropy 8-character CSPRNG string using window.crypto
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Ambiguous characters excluded
+    const array = new Uint8Array(8);
+    window.crypto.getRandomValues(array);
     let result = '';
-    for (let i = 0; i < 6; i++) {
-      result += chars.charAt(Math.floor(Math.random() * chars.length));
+    for (let i = 0; i < 8; i++) {
+      result += chars[array[i] % chars.length];
     }
     return result;
   };

@@ -19,17 +19,17 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Unauthorized access' }, { status: 401 });
     }
 
-    // 2. Verify Tenant (Church) Ownership Explicitly via Admin Profile
+    // 2. Verify Tenant (Church) Ownership Explicitly via Admin Profile & Role check (MT-04)
     const { data: adminProfile } = await supabaseUserClient
       .from('admin_profiles')
-      .select('tenant_id')
+      .select('tenant_id, role')
       .eq('id', user.id)
       .eq('tenant_id', churchId)
       .maybeSingle();
 
-    if (!adminProfile) {
-      console.error(`[SMS API] Explicit multi-tenancy check failed. User ${user.id} attempted to send for church ${churchId}`);
-      return NextResponse.json({ error: 'Access denied: You are not authorized as an admin for this church.' }, { status: 403 });
+    if (!adminProfile || !['pastor', 'admin'].includes(adminProfile.role)) {
+      console.error(`[SMS API] Multi-tenancy / role check failed. User ${user.id} attempted to send for church ${churchId}`);
+      return NextResponse.json({ error: 'Access denied: You must be a pastor or admin for this church.' }, { status: 403 });
     }
     
     const { data: authorizedChurch, error: tenantError } = await supabaseUserClient

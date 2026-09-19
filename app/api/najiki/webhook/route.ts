@@ -88,11 +88,11 @@ export async function POST(request: Request) {
 
     // Resolve tenant using tenantCode if available
     let resolvedTenantId: string | null = null;
-    if (tenantCode) {
+    if (tenantCode && typeof tenantCode === 'string') {
       const { data: tenant, error: tenantError } = await db
         .from('tenants')
         .select('id')
-        .eq('code', tenantCode)
+        .eq('code', tenantCode.trim())
         .maybeSingle();
 
       if (!tenantError && tenant) {
@@ -101,27 +101,33 @@ export async function POST(request: Request) {
       }
     }
 
-    // Find transaction by reference_code, idempotency_key, or paymentIntentId
-    const searchRef = reference || idempotencyKey;
-    let query = db.from('wallet_transactions').select('*');
-    if (searchRef && paymentIntentId) {
-      query = query.or(`reference_code.eq.${searchRef},idempotency_key.eq.${searchRef},reference_code.eq.${paymentIntentId}`);
-    } else if (searchRef) {
-      query = query.or(`reference_code.eq.${searchRef},idempotency_key.eq.${searchRef}`);
-    } else if (paymentIntentId) {
-      query = query.eq('reference_code', paymentIntentId);
+    // MT-08: Safe exact queries in sequence without string interpolation
+    let tx: any = null;
+
+    if (reference && typeof reference === 'string') {
+      const { data } = await db.from('wallet_transactions').select('*').eq('reference_code', reference.trim()).maybeSingle();
+      if (data) tx = data;
     }
 
-    let { data: tx, error: txError } = await query.maybeSingle();
+    if (!tx && idempotencyKey && typeof idempotencyKey === 'string') {
+      const { data } = await db.from('wallet_transactions').select('*').eq('idempotency_key', idempotencyKey.trim()).maybeSingle();
+      if (data) tx = data;
+    }
 
-    if (txError) {
-      console.error('[Najiki Webhook] DB lookup error:', txError);
-      return NextResponse.json({ error: 'DB Error' }, { status: 500 });
+    if (!tx && paymentIntentId && typeof paymentIntentId === 'string') {
+      const { data } = await db.from('wallet_transactions').select('*').eq('reference_code', paymentIntentId.trim()).maybeSingle();
+      if (data) tx = data;
     }
 
     if (!tx) {
       console.warn('[Najiki Webhook] Transaction not found for reference:', reference, 'or paymentIntentId:', paymentIntentId);
       return NextResponse.json({ received: true }, { status: 200 });
+    }
+
+    // MT-08: If tenantCode was provided in payload, require it to match tx.tenant_id
+    if (resolvedTenantId && resolvedTenantId !== tx.tenant_id) {
+      console.error(`[Najiki Webhook] Tenant mismatch! Payload resolved tenant ${resolvedTenantId} != tx tenant ${tx.tenant_id}`);
+      return NextResponse.json({ error: 'Tenant mismatch' }, { status: 403 });
     }
 
     // Underpayment guard: check webhook amount against expected transaction amount

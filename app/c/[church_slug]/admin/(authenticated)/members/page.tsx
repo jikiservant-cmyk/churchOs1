@@ -1,4 +1,4 @@
-import { createAdminClient } from '@/lib/supabase/server';
+import { requireTenant } from '@/lib/tenant';
 import { Users, Plus, MoreVertical, Pencil } from 'lucide-react';
 import { addMember, bulkAddMembers } from './actions';
 import CSVUploader from '@/components/CSVUploader';
@@ -15,22 +15,16 @@ export default async function MembersPage(props: {
 }) {
   const resolvedParams = await props.params;
   const searchParams = await props.searchParams;
-  const supabase = await createAdminClient(); // Use admin client to bypass RLS for server components
+  
+  // Enforce tenant authorization and verified context (MT-09)
+  const { church, supabase } = await requireTenant(resolvedParams.church_slug);
 
-  // Fetch church details first to get the ID for filtering
-  const { data: church, error: churchError } = await supabase
-    .schema('church')
-    .from('churches')
-    .select('id')
-    .eq('slug', resolvedParams.church_slug)
-    .maybeSingle();
-
-  // Fetch members. 
+  // Fetch members scoped to verified tenant
   let query = supabase
     .schema('church')
     .from('members')
     .select('*')
-    .eq('church_id', church?.id || '00000000-0000-0000-0000-000000000000');
+    .eq('church_id', church.id);
 
   if (searchParams.q) {
     query = query.ilike('full_name', `%${searchParams.q}%`);

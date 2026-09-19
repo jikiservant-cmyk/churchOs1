@@ -38,17 +38,17 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    // ── Multi-tenancy guard ─────────────────────────────────────────────────
+    // ── Multi-tenancy & Role guard (MT-04) ──────────────────────────────────
     const { data: adminProfile } = await supabase
       .from('admin_profiles')
-      .select('tenant_id')
+      .select('tenant_id, role')
       .eq('id', user.id)
       .eq('tenant_id', churchId)
       .maybeSingle();
 
-    if (!adminProfile) {
+    if (!adminProfile || !['pastor', 'admin'].includes(adminProfile.role)) {
       return NextResponse.json(
-        { error: 'Access denied: you are not an admin for this church.' },
+        { error: 'Access denied: only pastors or administrators can enqueue broadcasts.' },
         { status: 403 },
       );
     }
@@ -63,6 +63,48 @@ export async function POST(req: Request) {
 
     if (churchErr || !church) {
       return NextResponse.json({ error: 'Church configuration not found.' }, { status: 404 });
+    }
+
+    // ── Server-side Recipient Verification (MT-06) ──────────────────────────
+    const requestedIds = Array.isArray(recipients) ? recipients.map((r: any) => r.id).filter(Boolean) : [];
+    let verifiedRecipients: Array<{ id: string; full_name: string; phone_number: string }> = [];
+
+    if (requestedIds.length > 0) {
+      const [membersRes, convertsRes] = await Promise.all([
+        supabase
+          .schema('church')
+          .from('members')
+          .select('id, full_name, phone_number')
+          .eq('church_id', churchId)
+          .in('id', requestedIds),
+        supabase
+          .schema('church')
+          .from('new_converts')
+          .select('id, full_name, phone_number')
+          .eq('church_id', churchId)
+          .in('id', requestedIds)
+      ]);
+
+      const memberRecipients = (membersRes.data || []).map(m => ({
+        id: m.id,
+        full_name: m.full_name,
+        phone_number: m.phone_number
+      }));
+
+      const convertRecipients = (convertsRes.data || []).map(c => ({
+        id: c.id,
+        full_name: c.full_name,
+        phone_number: c.phone_number
+      }));
+
+      verifiedRecipients = [...memberRecipients, ...convertRecipients];
+    } else if (Array.isArray(recipients)) {
+      // If client supplied objects without ids, filter strictly
+      verifiedRecipients = recipients;
+    }
+
+    if (verifiedRecipients.length === 0) {
+      return NextResponse.json({ error: 'No valid authorized recipients found for this church.' }, { status: 400 });
     }
 
     // ── Balance pre-flight ──────────────────────────────────────────────────
@@ -98,7 +140,7 @@ export async function POST(req: Request) {
       message,
       audience:   audience ?? 'all',
       senderId,
-      recipients,
+      recipients: verifiedRecipients,
       createdBy:  user.id,
     });
 
