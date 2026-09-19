@@ -133,19 +133,22 @@ export async function sendSingleSMS({
         .maybeSingle();
 
       // Record transaction history
-      if (walletData?.id) {
-        await adminSupabase.from('wallet_transactions').insert({
-          tenant_id: churchId,
-          wallet_id: walletData.id,
-          amount: -balance.sms_rate,
-          type: 'SMS_SENT',
-          description: `Sent 1 SMS to ${finalPhone} via Najiki`,
-          reference_code: `SMS_${logId}_${Date.now()}`,
-          status: 'success',
-          idempotency_key: logId,
-          product: 'sms',
-          reference_id: logId
-        });
+      const { error: ledgerErr } = await adminSupabase.from('wallet_transactions').insert({
+        tenant_id: churchId,
+        wallet_id: walletData?.id,
+        amount: -balance.sms_rate,
+        type: 'SMS_SENT',
+        description: `Sent 1 SMS to ${finalPhone} via Najiki`,
+        reference_code: `SMS_${logId}_${Date.now()}`,
+        status: 'success',
+        idempotency_key: logId,
+        product: 'sms',
+        reference_id: logId
+      });
+
+      if (ledgerErr) {
+        console.error('[SMS Actions] Ledger write failed after debit:', ledgerErr);
+        throw new Error(`Ledger write failed after debit: ${ledgerErr.message}`);
       }
     } else {
       // Fallback to Africa's Talking
@@ -222,19 +225,22 @@ export async function sendSingleSMS({
         .maybeSingle();
 
       // Record transaction history
-      if (walletData?.id) {
-        await adminSupabase.from('wallet_transactions').insert({
-          tenant_id: churchId,
-          wallet_id: walletData.id,
-          amount: -balance.sms_rate,
-          type: 'SMS_SENT',
-          description: `Sent 1 SMS to ${finalPhone}`,
-          reference_code: `SMS_${logId}_${Date.now()}`,
-          status: 'success',
-          idempotency_key: logId,
-          product: 'sms',
-          reference_id: logId
-        });
+      const { error: ledgerErr } = await adminSupabase.from('wallet_transactions').insert({
+        tenant_id: churchId,
+        wallet_id: walletData?.id,
+        amount: -balance.sms_rate,
+        type: 'SMS_SENT',
+        description: `Sent 1 SMS to ${finalPhone}`,
+        reference_code: `SMS_${logId}_${Date.now()}`,
+        status: 'success',
+        idempotency_key: logId,
+        product: 'sms',
+        reference_id: logId
+      });
+
+      if (ledgerErr) {
+        console.error('[SMS Actions] Ledger write failed after debit:', ledgerErr);
+        throw new Error(`Ledger write failed after debit: ${ledgerErr.message}`);
       }
     }
 

@@ -84,12 +84,14 @@ export async function provisionTenant(prevState: ProvisionState, formData: FormD
     currentStep = 'calling-rpc';
     
     // Use the atomic RPC to handle everything in one transaction
+    const clientIp = (ip && ip !== 'unknown' && ip !== '127.0.0.1' && ip !== '::1') ? ip : null;
     const { data: tenantId, error: rpcError } = await adminSupabase
       .rpc('provision_church_v2', {
         p_user_id: user.id,
         p_name: sanitizedName,
         p_slug: sanitizedSlug,
-        p_role: 'pastor'
+        p_role: 'pastor',
+        p_ip: clientIp
       });
 
     if (rpcError) {

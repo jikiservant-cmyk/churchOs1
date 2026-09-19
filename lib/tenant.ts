@@ -42,3 +42,29 @@ export async function requireTenant(churchSlug: string) {
 
   return { church, user, profile, supabase };
 }
+
+export async function assertChurchAdminAuth(churchSlug: string) {
+  const canonical = churchSlug.toLowerCase().trim();
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(canonical)) {
+    throw new Error('Invalid church identifier');
+  }
+
+  const church = await getChurchBySlug(canonical);
+  if (!church) throw new Error('Church not found');
+
+  const supabase = await createClient();
+  const { data: { user }, error: authError } = await supabase.auth.getUser();
+  if (authError || !user) throw new Error('Unauthenticated');
+
+  const { data: profile } = await supabase
+    .from('admin_profiles')
+    .select('role, tenant_id')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  if (!profile || profile.tenant_id !== church.id) {
+    throw new Error('Unauthorized to perform this action for this church');
+  }
+
+  return { supabase, user, church, churchId: church.id };
+}

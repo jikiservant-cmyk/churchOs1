@@ -82,7 +82,16 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
     }
 
     const expectedPasskey = (church.passkey || '').trim();
+    if (!expectedPasskey || expectedPasskey.length < 4) {
+      console.error('[validateUsherPasskey] church has no usable passkey configured');
+      return { success: false, error: 'Usher portal is not configured for this church.' };
+    }
+
     const providedPasskey = (passkey || '').trim();
+    if (!providedPasskey || providedPasskey.length < 4) {
+      recordUsherFailedAttempt(canonicalSlug);
+      return { success: false, error: 'Invalid passkey. Passkey must be at least 4 characters.' };
+    }
     
     // Constant-time comparison to prevent timing side channels
     const expectedBuf = Buffer.from(expectedPasskey);
@@ -171,6 +180,17 @@ export async function createEvent(formData: FormData, churchId: string, churchSl
   if (!user) {
     console.error('CreateEvent: No authenticated user found');
     return { error: 'You must be logged in to create services.' };
+  }
+
+  // Verify caller's admin profile belongs to this church
+  const { data: profile } = await supabase
+    .from('admin_profiles')
+    .select('tenant_id, role')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  if (!profile || profile.tenant_id !== churchId) {
+    return { error: 'Unauthorized: you do not have permission to manage events for this church.' };
   }
 
   const name = formData.get('name') as string;

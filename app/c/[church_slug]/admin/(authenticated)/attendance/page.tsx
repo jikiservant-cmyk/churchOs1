@@ -1,5 +1,6 @@
 import { Metadata } from 'next';
 import { createAdminClient } from '@/lib/supabase/server';
+import { requireTenant } from '@/lib/tenant';
 import { redirect, notFound } from 'next/navigation';
 import { revalidatePath } from 'next/cache';
 import { Plus, Calendar, Clock, MapPin, CheckCircle2, ChevronRight, Activity, AlertCircle } from 'lucide-react';
@@ -23,26 +24,16 @@ export default async function AttendancePage(props: {
 }) {
   const resolvedParams = await props.params;
   const { church_slug } = resolvedParams;
+
+  // Enforce tenant authorization and retrieve verified church and profile
+  const { church, user, profile: adminProfile } = await requireTenant(church_slug);
   const supabase = await createAdminClient();
 
-  // Get Admin Profile to verify access
-  const { data: { user } } = await supabase.auth.getUser();
-  
-  const { data: church } = await supabase
+  const { data: churchDetails } = await supabase
     .schema('church')
     .from('churches')
-    .select('id, name, passkey')
-    .eq('slug', church_slug)
-    .single();
-
-  if (!church) notFound();
-
-  // Verify Admin Access explicitly just in case
-  const { data: adminProfile } = await supabase
-    .from('admin_profiles')
-    .select('*')
-    .eq('id', user?.id)
-    .eq('tenant_id', church.id)
+    .select('passkey')
+    .eq('id', church.id)
     .maybeSingle();
 
   const { data: events } = await supabase
@@ -86,30 +77,17 @@ export default async function AttendancePage(props: {
       </div>
 
       <div className="flex items-center justify-end gap-3 pt-2">
-        <CopyPortalLink churchSlug={church_slug} passkey={church.passkey || '1234'} />
+        <CopyPortalLink churchSlug={church_slug} passkey={churchDetails?.passkey || ''} />
       </div>
 
       <PasskeyManager 
         churchId={church.id} 
-        initialPasskey={church.passkey || '1234'} 
+        initialPasskey={churchDetails?.passkey || ''} 
         churchSlug={church_slug} 
       />
 
       {/* Action Bar */}
       <CreateEventForm churchId={church.id} churchSlug={church_slug} />
-
-      {/* Admin Status Notice */}
-      {!adminProfile && user && (
-        <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl space-y-1 text-amber-800">
-          <div className="flex items-center gap-3">
-            <AlertCircle className="w-5 h-5 flex-shrink-0" />
-            <div>
-              <p className="font-bold text-sm">Access Notice</p>
-              <p className="text-[13px]">You are logged in as <span className="font-mono text-[11px]">{user?.email || 'authenticated user'}</span> without an active administrator role for this church.</p>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Active Services (Checking In Now) */}
       {activeEvents.length > 0 && (

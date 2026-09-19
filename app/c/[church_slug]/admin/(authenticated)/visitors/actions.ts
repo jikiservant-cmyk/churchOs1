@@ -1,24 +1,12 @@
 'use server';
 
 import { createClient, createAdminClient } from '@/lib/supabase/server';
+import { assertChurchAdminAuth } from '@/lib/tenant';
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
 import { normalizeUgPhone } from '@/lib/utils';
 
-async function checkChurchAdminAuth(churchSlug: string) {
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) throw new Error('Unauthenticated');
-
-  const adminSupabase = await createAdminClient();
-  const { data: church } = await adminSupabase.schema('church').from('churches').select('id').eq('slug', churchSlug).single();
-  if (!church) throw new Error('Church not found');
-
-  const { data: profile } = await adminSupabase.from('admin_profiles').select('tenant_id').eq('id', user.id).eq('tenant_id', church.id).single();
-  if (!profile) throw new Error('Unauthorized to perform this action for this church');
-
-  return { supabase, user, churchId: church.id };
-}
+const checkChurchAdminAuth = assertChurchAdminAuth;
 
 export async function addVisitor(formData: FormData) {
   let churchSlug = formData.get('churchSlug') as string;

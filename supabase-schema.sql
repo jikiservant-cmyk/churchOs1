@@ -55,32 +55,42 @@ BEGIN
   END IF;
 END $$;
 
--- 2. Create the churches table (in the custom schema)
+-- 2. Create Unified Tenant Schema first (referenced by admin_profiles)
+CREATE TABLE IF NOT EXISTS public.tenants (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  app_type text NOT NULL DEFAULT 'church', 
+  name text NOT NULL,
+  code text UNIQUE,
+  created_at timestamptz DEFAULT now()
+);
+
+-- 3. Create the churches table (in the custom schema)
 CREATE TABLE IF NOT EXISTS church.churches (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   name text NOT NULL,
   code text UNIQUE,
-  slug text NOT NULL UNIQUE,
-  passkey text, -- 4-6 digit entrance code for ushers (generated on provisioning)
-  app_type text DEFAULT 'church', -- Added to match unified app structure
+  slug text NOT NULL UNIQUE CONSTRAINT slug_canonical CHECK (slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'),
+  passkey text NOT NULL DEFAULT lpad(floor(random() * 900000 + 100000)::text, 6, '0'),
+  app_type text DEFAULT 'church',
   theme_color text DEFAULT 'bg-blue-600',
   logo_url text,
   sender_id text,
+  ip_address text,
   created_at timestamptz DEFAULT now()
 );
 
--- 3. Create the admin_profiles table in public
+-- 4. Create the admin_profiles table in public (references public.tenants)
 CREATE TABLE IF NOT EXISTS public.admin_profiles (
   id uuid REFERENCES auth.users(id) ON DELETE CASCADE PRIMARY KEY,
   email text, 
   tenant_id uuid REFERENCES public.tenants(id), 
   app_type text DEFAULT 'church', 
   role admin_role_enum NOT NULL DEFAULT 'pastor',
-  full_name text, -- Added as per actual schema
+  full_name text,
   created_at timestamptz DEFAULT now()
 );
 
--- 4. Create the sms_logs table
+-- 5. Create the sms_logs table
 CREATE TABLE IF NOT EXISTS church.sms_logs (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   tenant_id uuid REFERENCES church.churches(id) NOT NULL,
@@ -94,15 +104,6 @@ CREATE TABLE IF NOT EXISTS church.sms_logs (
   error_message text,
   created_at timestamptz DEFAULT now(),
   updated_at timestamptz DEFAULT now()
-);
-
--- 5. Create Unified Tenant & Wallet Schema
-CREATE TABLE IF NOT EXISTS public.tenants (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  app_type text NOT NULL DEFAULT 'church', 
-  name text NOT NULL,
-  code text UNIQUE,
-  created_at timestamptz DEFAULT now()
 );
 
 -- Audit Logs (Removed as per user verification that it does not exist)
@@ -155,11 +156,14 @@ END $$;
 -- First drop any existing versions to avoid "could not choose best candidate" errors
 DROP FUNCTION IF EXISTS public.provision_church_v2(uuid, text, text, text);
 DROP FUNCTION IF EXISTS public.provision_church_v2(text, text, text, uuid);
+DROP FUNCTION IF EXISTS public.provision_church_v2(uuid, text, text, text, text);
+
 CREATE OR REPLACE FUNCTION public.provision_church_v2(
   p_user_id uuid,
   p_name text,
   p_slug text,
-  p_role text
+  p_role text,
+  p_ip text DEFAULT NULL
 )
 RETURNS uuid
 LANGUAGE plpgsql
@@ -170,6 +174,7 @@ DECLARE
   v_tenant_uuid uuid;
   v_user_email text;
   v_role public.admin_role_enum;
+  v_canonical_slug text;
 BEGIN
   IF p_user_id IS NULL THEN
     RAISE EXCEPTION 'User ID is required';
@@ -180,21 +185,39 @@ BEGIN
     RAISE EXCEPTION 'Unauthorized: cannot provision workspace for another user';
   END IF;
 
-  -- Quota check: prevent user from provisioning multiple churches and squatting slugs
-  IF EXISTS (
-    SELECT 1
-    FROM public.admin_profiles
-    WHERE id = p_user_id AND tenant_id IS NOT NULL
-  ) THEN
+  -- Quota check with lock: prevent concurrent double provisioning (F10 remediation)
+  PERFORM 1
+  FROM public.admin_profiles
+  WHERE id = p_user_id AND tenant_id IS NOT NULL
+  FOR UPDATE;
+
+  IF FOUND THEN
     RAISE EXCEPTION 'You already belong to an existing church workspace. Multi-workspace creation is restricted.';
+  END IF;
+
+  -- Validate and canonicalize slug format (F6 remediation)
+  v_canonical_slug := lower(trim(p_slug));
+  IF NOT (v_canonical_slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$') THEN
+    RAISE EXCEPTION 'Invalid slug format. Slugs must contain only lowercase alphanumeric characters and single hyphens.';
   END IF;
 
   IF EXISTS (
     SELECT 1
     FROM church.churches
-    WHERE lower(slug) = lower(p_slug)
+    WHERE slug = v_canonical_slug
   ) THEN
     RAISE EXCEPTION 'Workspace URL (slug) is already taken';
+  END IF;
+
+  -- IP Rate check if provided (F5 remediation)
+  IF p_ip IS NOT NULL AND p_ip <> '' AND p_ip <> 'unknown' AND p_ip <> '127.0.0.1' AND p_ip <> '::1' THEN
+    IF EXISTS (
+      SELECT 1
+      FROM church.churches
+      WHERE ip_address = p_ip
+    ) THEN
+      RAISE EXCEPTION 'Only one church registration is allowed per network/location to prevent scams.';
+    END IF;
   END IF;
 
   SELECT u.email INTO v_user_email
@@ -228,14 +251,16 @@ BEGIN
     name,
     slug,
     passkey,
-    app_type
+    app_type,
+    ip_address
   )
   VALUES (
     v_tenant_uuid,
     p_name,
-    p_slug,
+    v_canonical_slug,
     lpad(floor(random() * 900000 + 100000)::text, 6, '0'),
-    'church'
+    'church',
+    p_ip
   );
 
   INSERT INTO public.admin_profiles (
@@ -253,15 +278,20 @@ BEGIN
     v_role,
     p_name,
     'church'
-  );
+  )
+  ON CONFLICT (id) DO UPDATE SET
+    tenant_id = v_tenant_uuid,
+    role = v_role,
+    full_name = p_name,
+    email = v_user_email;
 
   RETURN v_tenant_uuid;
 END;
 $$;
 
 -- Explicit Permission Grants
-REVOKE EXECUTE ON FUNCTION public.provision_church_v2(uuid, text, text, text) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION public.provision_church_v2(uuid, text, text, text)
+REVOKE EXECUTE ON FUNCTION public.provision_church_v2(uuid, text, text, text, text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.provision_church_v2(uuid, text, text, text, text)
 TO authenticated, service_role;
 
 GRANT USAGE ON SCHEMA public TO authenticated, service_role;
@@ -339,12 +369,21 @@ FOR EACH ROW
 EXECUTE FUNCTION church.create_tenant_for_church();
 
 CREATE TABLE IF NOT EXISTS public.wallets (
+  id uuid DEFAULT gen_random_uuid() UNIQUE,
   tenant_id uuid REFERENCES public.tenants(id) PRIMARY KEY,
   balance bigint NOT NULL DEFAULT 0,
   sms_rate int NOT NULL DEFAULT 70, 
   last_updated timestamptz DEFAULT now(),
   app_type text NOT NULL
 );
+
+-- Ensure id column exists on public.wallets if already created
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='wallets' AND column_name='id') THEN
+    ALTER TABLE public.wallets ADD COLUMN id uuid DEFAULT gen_random_uuid() UNIQUE;
+  END IF;
+END $$;
 
 -- Trigger: Auto-initialize wallet for new tenants
 CREATE OR REPLACE FUNCTION public.initialize_tenant_wallet()
@@ -366,20 +405,49 @@ EXECUTE FUNCTION public.initialize_tenant_wallet();
 CREATE TABLE IF NOT EXISTS public.wallet_transactions (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   tenant_id uuid REFERENCES public.tenants(id) NOT NULL,
+  wallet_id uuid REFERENCES public.wallets(id),
   amount int NOT NULL, -- Negative for debit, Positive for credit
-  type text NOT NULL CHECK (type IN ('TOPUP','SMS_SENT','REFUND','ADJUSTMENT','BONUS','REVERSAL','credit','debit')),
+  type text NOT NULL CHECK (type IN ('TOPUP','SMS_SENT','REFUND','ADJUSTMENT','BONUS','REVERSAL','credit','debit','sms_topup')),
+  direction text DEFAULT 'credit',
+  note text,
   description text,
   reference_code text UNIQUE,
+  reference text,
   status text NOT NULL DEFAULT 'success', -- 'pending', 'success', 'failed'
   created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now(),
   idempotency_key text UNIQUE,
   product text DEFAULT 'sms',
   created_by text,
   reference_id text,
   cost_ugx bigint,
   revenue_ugx bigint,
-  provider_payload jsonb DEFAULT '{}'::jsonb
+  provider_payload jsonb DEFAULT '{}'::jsonb,
+  raw_provider_response jsonb DEFAULT '{}'::jsonb
 );
+
+-- Ensure all transaction columns exist on existing databases
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='wallet_transactions' AND column_name='wallet_id') THEN
+    ALTER TABLE public.wallet_transactions ADD COLUMN wallet_id uuid REFERENCES public.wallets(id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='wallet_transactions' AND column_name='direction') THEN
+    ALTER TABLE public.wallet_transactions ADD COLUMN direction text DEFAULT 'credit';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='wallet_transactions' AND column_name='note') THEN
+    ALTER TABLE public.wallet_transactions ADD COLUMN note text;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='wallet_transactions' AND column_name='reference') THEN
+    ALTER TABLE public.wallet_transactions ADD COLUMN reference text;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='wallet_transactions' AND column_name='updated_at') THEN
+    ALTER TABLE public.wallet_transactions ADD COLUMN updated_at timestamptz DEFAULT now();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='wallet_transactions' AND column_name='raw_provider_response') THEN
+    ALTER TABLE public.wallet_transactions ADD COLUMN raw_provider_response jsonb DEFAULT '{}'::jsonb;
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS public.billing_events (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -711,14 +779,17 @@ ALTER TABLE church.members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE church.new_converts ENABLE ROW LEVEL SECURITY;
 
 -- 10. Insert initial demo data for Grace Church
-INSERT INTO church.churches (id, name, slug, theme_color, logo_url)
+INSERT INTO church.churches (id, name, slug, passkey, theme_color, logo_url)
 VALUES (
   '11111111-1111-1111-1111-111111111111',
   'Grace Church Kampala', 
   'grace', 
+  '829471',
   'bg-green-600', 
   'https://picsum.photos/seed/grace/200/200'
-) ON CONFLICT (id) DO UPDATE SET slug = EXCLUDED.slug;
+) ON CONFLICT (id) DO UPDATE SET 
+  slug = EXCLUDED.slug,
+  passkey = COALESCE(church.churches.passkey, EXCLUDED.passkey);
 
 -- 11. Tables for Dashboard (Events, Attendance, Prayers, Groups, Donations)
 -- Events / Services
@@ -794,7 +865,6 @@ CREATE TABLE IF NOT EXISTS church.small_groups (
   name text NOT NULL,
   code text UNIQUE,
   leader_name text NOT NULL,
-  code text UNIQUE,
   meeting_day text NOT NULL,
   member_count int DEFAULT 0,
   created_at timestamptz DEFAULT now()
@@ -829,9 +899,10 @@ CREATE POLICY "Service role has full access to churches"
   TO service_role
   USING (true);
 
--- Public view exposing safe metadata without secrets (passkeys) for landing pages/portals
-CREATE OR REPLACE VIEW public.churches_public AS
-  SELECT id, name, slug, app_type, sender_id, logo_url, theme_color, created_at
+-- Public view exposing safe metadata without secrets (passkeys, sender_id) for landing pages/portals
+DROP VIEW IF EXISTS public.churches_public;
+CREATE OR REPLACE VIEW public.churches_public WITH (security_invoker = true) AS
+  SELECT id, name, slug, app_type, logo_url, theme_color, created_at
   FROM church.churches;
 
 GRANT SELECT ON public.churches_public TO anon, authenticated, service_role;
@@ -1432,12 +1503,27 @@ CREATE TABLE IF NOT EXISTS church.broadcasts (
   status text NOT NULL DEFAULT 'QUEUED',
   created_by uuid REFERENCES auth.users(id) ON DELETE SET NULL,
   created_at timestamptz DEFAULT now(),
+  started_at timestamptz,
+  updated_at timestamptz DEFAULT now(),
   completed_at timestamptz
 );
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='church' AND table_name='broadcasts' AND column_name='started_at') THEN
+    ALTER TABLE church.broadcasts ADD COLUMN started_at timestamptz;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='church' AND table_name='broadcasts' AND column_name='updated_at') THEN
+    ALTER TABLE church.broadcasts ADD COLUMN updated_at timestamptz DEFAULT now();
+  END IF;
+END $$;
 
 ALTER TABLE church.broadcasts ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "broadcasts_tenant_select" ON church.broadcasts FOR SELECT TO authenticated USING (tenant_id = church.my_tenant_id());
+CREATE POLICY "broadcasts_tenant_insert" ON church.broadcasts FOR INSERT TO authenticated WITH CHECK (tenant_id = church.my_tenant_id());
+CREATE POLICY "broadcasts_tenant_update" ON church.broadcasts FOR UPDATE TO authenticated USING (tenant_id = church.my_tenant_id()) WITH CHECK (tenant_id = church.my_tenant_id());
+CREATE POLICY "broadcasts_tenant_delete" ON church.broadcasts FOR DELETE TO authenticated USING (tenant_id = church.my_tenant_id());
 CREATE POLICY "broadcasts_service_role" ON church.broadcasts FOR ALL TO service_role USING (true);
 
 CREATE TABLE IF NOT EXISTS church.sms_queue (
@@ -1462,6 +1548,9 @@ CREATE TABLE IF NOT EXISTS church.sms_queue (
 ALTER TABLE church.sms_queue ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "sms_queue_tenant_select" ON church.sms_queue FOR SELECT TO authenticated USING (tenant_id = church.my_tenant_id());
+CREATE POLICY "sms_queue_tenant_insert" ON church.sms_queue FOR INSERT TO authenticated WITH CHECK (tenant_id = church.my_tenant_id());
+CREATE POLICY "sms_queue_tenant_update" ON church.sms_queue FOR UPDATE TO authenticated USING (tenant_id = church.my_tenant_id()) WITH CHECK (tenant_id = church.my_tenant_id());
+CREATE POLICY "sms_queue_tenant_delete" ON church.sms_queue FOR DELETE TO authenticated USING (tenant_id = church.my_tenant_id());
 CREATE POLICY "sms_queue_service_role" ON church.sms_queue FOR ALL TO service_role USING (true);
 
 -- Claim SMS Queue Batch (Skip Locked)

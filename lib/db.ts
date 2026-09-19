@@ -12,13 +12,18 @@ export const getChurchBySlug = async (slug: string): Promise<Church | null> => {
   // Use Admin Client to bypass RLS for public church metadata lookup
   if (process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
     try {
+      const canonical = slug.toLowerCase().trim();
+      // Strict canonical slug check: reject wildcards, special characters, and non-canonical strings
+      if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(canonical)) {
+        return null;
+      }
+
       const supabase = await createAdminClient();
-      const normalizedSlug = slug.toLowerCase().trim();
       const { data, error } = await supabase
         .schema('church')
         .from('churches')
         .select('id, name, slug, theme_color, logo_url')
-        .ilike('slug', normalizedSlug)
+        .eq('slug', canonical)
         .maybeSingle();
 
       if (error) {

@@ -36,11 +36,17 @@ export async function middleware(request: NextRequest) {
   try {
     const url = new URL(request.url);
 
-    // CSRF Protection for state-changing API mutations (H4 remediation)
+    // CSRF Protection for state-changing API mutations (F7 remediation)
+    const PUBLIC_EXEMPT_ROUTES = new Set([
+      '/api/billing/topup',
+      '/api/sms/process-queue',
+      '/api/najiki/webhook',
+      '/api/webhooks/najiki',
+      '/api/relworx/webhook'
+    ]);
+
     if (url.pathname.startsWith('/api/') && ['POST', 'PUT', 'DELETE', 'PATCH'].includes(request.method)) {
-      const isPublicWebhook = url.pathname.includes('/webhook') || 
-                              url.pathname.includes('/billing/topup') ||
-                              url.pathname.includes('/sms/process-queue');
+      const isPublicWebhook = PUBLIC_EXEMPT_ROUTES.has(url.pathname);
       if (!isPublicWebhook) {
         const secFetchSite = request.headers.get('sec-fetch-site');
         const origin = request.headers.get('origin');
