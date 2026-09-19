@@ -18,36 +18,39 @@ export async function POST(request: Request) {
   // ── 1. Read raw body before parsing (required for HMAC check) ────────────
   const rawBody = await request.text();
 
-  // ── 2. Verify webhook signature ───────────────────────────────────────────
+  // ── 2. Verify webhook signature (Fail-Closed) ────────────────────────────
   const secret = process.env.LIVEPAY_WEBHOOK_SECRET ?? process.env.WEBHOOK_SECRET;
+
+  if (!secret) {
+    console.error('[topup webhook] Missing LIVEPAY_WEBHOOK_SECRET / WEBHOOK_SECRET — rejecting webhook');
+    return NextResponse.json({ error: 'Webhook secret not configured' }, { status: 500 });
+  }
 
   const incomingSig =
     request.headers.get('x-livepay-signature') ??
     request.headers.get('x-webhook-signature') ??
     '';
 
-  if (secret) {
-    // Missing signature header = immediate reject
-    if (!incomingSig) {
-      console.error('[topup webhook] Missing signature header — rejected');
-      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
-    }
+  // Missing signature header = immediate reject
+  if (!incomingSig) {
+    console.error('[topup webhook] Missing signature header — rejected');
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+  }
 
-    const expected = crypto
-      .createHmac('sha256', secret)
-      .update(rawBody)
-      .digest('hex');
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(rawBody)
+    .digest('hex');
 
-    // Strip "sha256=" prefix that some providers include
-    const normalizedSig = incomingSig.replace(/^sha256=/, '');
+  // Strip "sha256=" prefix that some providers include
+  const normalizedSig = incomingSig.replace(/^sha256=/, '');
 
-    if (
-      expected.length !== normalizedSig.length ||
-      !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(normalizedSig))
-    ) {
-      console.error('[topup webhook] Invalid signature — rejected');
-      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
-    }
+  if (
+    expected.length !== normalizedSig.length ||
+    !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(normalizedSig))
+  ) {
+    console.error('[topup webhook] Invalid signature — rejected');
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 
   // ── 3. Parse payload ──────────────────────────────────────────────────────
@@ -111,6 +114,16 @@ export async function POST(request: Request) {
   if (!tx) {
     console.log(`[topup webhook] Reference ${reference} not found or already processed.`);
     return NextResponse.json({ received: true });
+  }
+
+  // Verify amount paid matches or exceeds the expected transaction amount
+  const incomingAmount = payload.amount ?? payload.charged_amount ?? payload.amount_paid;
+  if (incomingAmount !== undefined && incomingAmount !== null) {
+    const parsedAmount = Number(incomingAmount);
+    if (!isNaN(parsedAmount) && parsedAmount < tx.amount) {
+      console.error(`[topup webhook] Underpayment detected! Expected ${tx.amount}, got ${parsedAmount}`);
+      return NextResponse.json({ error: 'Amount mismatch' }, { status: 400 });
+    }
   }
 
   // ── 6. Process atomically via single DB transaction ───────────────────────

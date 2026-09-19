@@ -18,25 +18,33 @@ export async function POST(request: Request) {
     const rawBody = await request.text();
     console.log('[Najiki Webhook] Raw payload received:', rawBody.substring(0, 200));
 
-    // 2. Verify Najiki webhook signature
-    const apiKey = process.env.NAJIKI_API_KEY;
+    // 2. Verify Najiki webhook signature (Fail-Closed)
+    const apiKey = process.env.NAJIKI_WEBHOOK_SECRET || process.env.NAJIKI_API_KEY;
     const incomingSig = request.headers.get('x-najiki-signature') || '';
 
-    if (apiKey) {
-      const expectedSig = crypto
-        .createHmac('sha256', apiKey)
-        .update(rawBody)
-        .digest('hex');
+    if (!apiKey) {
+      console.error('[Najiki Webhook] NAJIKI_WEBHOOK_SECRET / NAJIKI_API_KEY not set — rejecting webhook');
+      return NextResponse.json({ error: 'Webhook secret unconfigured' }, { status: 500 });
+    }
 
-      if (
-        expectedSig.length !== incomingSig.length ||
-        !crypto.timingSafeEqual(Buffer.from(expectedSig), Buffer.from(incomingSig))
-      ) {
-        console.error('[Najiki Webhook] Invalid signature — rejected');
-        return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
-      }
-    } else {
-      console.warn('[Najiki Webhook] NAJIKI_API_KEY not set — skipping signature verification (not recommended!)');
+    if (!incomingSig) {
+      console.error('[Najiki Webhook] Missing signature header — rejected');
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    const expectedSig = crypto
+      .createHmac('sha256', apiKey)
+      .update(rawBody)
+      .digest('hex');
+
+    const normalizedSig = incomingSig.replace(/^sha256=/, '');
+
+    if (
+      expectedSig.length !== normalizedSig.length ||
+      !crypto.timingSafeEqual(Buffer.from(expectedSig), Buffer.from(normalizedSig))
+    ) {
+      console.error('[Najiki Webhook] Invalid signature — rejected');
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     // 3. Parse the payload
@@ -48,7 +56,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
     }
 
-    console.log('[Najiki Webhook] Parsed payload:', JSON.stringify(payload, null, 2));
+    console.log('[Najiki Webhook] Parsed payload event:', payload.eventType || payload.status);
 
     const db = getServiceDb();
 
@@ -93,15 +101,15 @@ export async function POST(request: Request) {
       }
     }
 
-    // Find transaction by reference, idempotencyKey, or paymentIntentId
+    // Find transaction by reference_code, idempotency_key, or paymentIntentId
     const searchRef = reference || idempotencyKey;
     let query = db.from('wallet_transactions').select('*');
     if (searchRef && paymentIntentId) {
-      query = query.or(`reference.eq.${searchRef},reference.eq.${paymentIntentId}`);
+      query = query.or(`reference_code.eq.${searchRef},idempotency_key.eq.${searchRef},reference_code.eq.${paymentIntentId}`);
     } else if (searchRef) {
-      query = query.eq('reference', searchRef);
+      query = query.or(`reference_code.eq.${searchRef},idempotency_key.eq.${searchRef}`);
     } else if (paymentIntentId) {
-      query = query.eq('reference', paymentIntentId);
+      query = query.eq('reference_code', paymentIntentId);
     }
 
     let { data: tx, error: txError } = await query.maybeSingle();
@@ -116,28 +124,35 @@ export async function POST(request: Request) {
       return NextResponse.json({ received: true }, { status: 200 });
     }
 
+    // Underpayment guard: check webhook amount against expected transaction amount
+    if (amount !== undefined && amount !== null) {
+      const incomingAmount = Number(amount);
+      if (!isNaN(incomingAmount) && incomingAmount < tx.amount) {
+        console.error(`[Najiki Webhook] Underpayment detected! Expected ${tx.amount}, got ${incomingAmount}`);
+        return NextResponse.json({ error: 'Amount mismatch' }, { status: 400 });
+      }
+    }
+
     // Handle success
     if (status === 'success') {
-      // Use existing process_topup_webhook RPC if available, otherwise handle manually
       try {
-        // Try to use the existing RPC
+        // ALWAYS pass tx.amount (the verified database amount) into process_topup_webhook
         const { data: rpcResult, error: rpcErr } = await db.rpc('process_topup_webhook', {
-          p_reference: reference,
+          p_reference: tx.reference_code || reference,
           p_tenant_id: resolvedTenantId || tx.tenant_id,
-          p_amount: amount,
+          p_amount: tx.amount,
           p_payload: payload
         });
 
         if (rpcErr) {
           console.warn('[Najiki Webhook] process_topup_webhook RPC failed, falling back to manual:', rpcErr);
-          // Fallback to manual processing
           await handleSuccessManually(db, tx, payload, resolvedTenantId);
         } else {
           console.log('[Najiki Webhook] RPC succeeded:', rpcResult);
         }
 
         revalidatePath('/', 'layout');
-        console.log('[Najiki Webhook] ✅ Success! Wallet credited. Amount:', amount);
+        console.log('[Najiki Webhook] ✅ Success! Wallet credited. Amount:', tx.amount);
         return NextResponse.json({ received: true });
 
       } catch (fallbackErr) {
@@ -145,7 +160,6 @@ export async function POST(request: Request) {
         revalidatePath('/', 'layout');
         return NextResponse.json({ received: true });
       }
-
     } else if (status === 'failed') {
       // Mark as failed
       await db

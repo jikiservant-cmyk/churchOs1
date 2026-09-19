@@ -175,6 +175,11 @@ BEGIN
     RAISE EXCEPTION 'User ID is required';
   END IF;
 
+  -- Ensure caller matches p_user_id unless called via service_role bypass
+  IF auth.uid() IS NOT NULL AND p_user_id IS DISTINCT FROM auth.uid() THEN
+    RAISE EXCEPTION 'Unauthorized: cannot provision workspace for another user';
+  END IF;
+
   IF EXISTS (
     SELECT 1
     FROM church.churches
@@ -244,8 +249,9 @@ END;
 $$;
 
 -- Explicit Permission Grants
+REVOKE EXECUTE ON FUNCTION public.provision_church_v2(uuid, text, text, text) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.provision_church_v2(uuid, text, text, text)
-TO anon, authenticated, service_role;
+TO authenticated, service_role;
 
 GRANT USAGE ON SCHEMA public TO authenticated, service_role;
 GRANT USAGE ON SCHEMA church TO authenticated, service_role;
@@ -393,12 +399,42 @@ DROP FUNCTION IF EXISTS church.deduct_sms_credit();
 CREATE OR REPLACE FUNCTION public.increment_wallet_balance(p_tenant_id uuid, p_amount bigint)
 RETURNS void AS $$
 BEGIN
+  IF p_amount <= 0 THEN
+    RAISE EXCEPTION 'Increment amount must be positive';
+  END IF;
+
   UPDATE public.wallets
   SET balance = balance + p_amount,
       last_updated = now()
   WHERE tenant_id = p_tenant_id;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
+
+REVOKE EXECUTE ON FUNCTION public.increment_wallet_balance(uuid, bigint) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.increment_wallet_balance(uuid, bigint) TO service_role;
+
+-- RPC: Atomic decrement for SMS sending (prevents TOCTOU balance races)
+CREATE OR REPLACE FUNCTION public.decrement_wallet_balance(p_tenant_id uuid, p_amount bigint)
+RETURNS boolean AS $$
+DECLARE
+  v_rows_updated int;
+BEGIN
+  IF p_amount <= 0 THEN
+    RAISE EXCEPTION 'Decrement amount must be positive';
+  END IF;
+
+  UPDATE public.wallets
+  SET balance = balance - p_amount,
+      last_updated = now()
+  WHERE tenant_id = p_tenant_id AND balance >= p_amount;
+
+  GET DIAGNOSTICS v_rows_updated = ROW_COUNT;
+  RETURN v_rows_updated > 0;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
+
+REVOKE EXECUTE ON FUNCTION public.decrement_wallet_balance(uuid, bigint) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.decrement_wallet_balance(uuid, bigint) TO service_role;
 
 -- Create church.my_tenant_id() helper function FIRST (before policies use it)
 CREATE OR REPLACE FUNCTION church.my_tenant_id()
@@ -411,7 +447,7 @@ BEGIN
     LIMIT 1
   );
 END;
-$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, church;
 
 -- 8. Consolidated RLS Policies for Other Tables
 ALTER TABLE church.sms_logs ENABLE ROW LEVEL SECURITY;
@@ -763,11 +799,26 @@ ALTER TABLE church.prayers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE church.small_groups ENABLE ROW LEVEL SECURITY;
 ALTER TABLE church.donations ENABLE ROW LEVEL SECURITY;
 
--- Church Metadata Policy (Publicly viewable for landing pages/portals)
-CREATE POLICY "Churches are viewable by everyone" 
+-- Church Security: Restrict direct SELECT on church.churches to tenant owner / service_role
+DROP POLICY IF EXISTS "Churches are viewable by everyone" ON church.churches;
+DROP POLICY IF EXISTS "Pastors can view their own church" ON church.churches;
+CREATE POLICY "Pastors can view their own church" 
   ON church.churches FOR SELECT 
-  TO public 
+  TO authenticated 
+  USING (id = church.my_tenant_id());
+
+DROP POLICY IF EXISTS "Service role has full access to churches" ON church.churches;
+CREATE POLICY "Service role has full access to churches"
+  ON church.churches FOR ALL
+  TO service_role
   USING (true);
+
+-- Public view exposing safe metadata without secrets (passkeys) for landing pages/portals
+CREATE OR REPLACE VIEW public.churches_public AS
+  SELECT id, name, slug, app_type, sender_id, logo_url, theme_color, created_at
+  FROM church.churches;
+
+GRANT SELECT ON public.churches_public TO anon, authenticated, service_role;
 
 -- Additional RLS Policies (using church.my_tenant_id())
 DROP POLICY IF EXISTS "Pastors can manage their attendance logs" ON church.attendance_logs;
@@ -840,6 +891,11 @@ BEGIN
   -- Basic integrity
   IF p_church_id IS NULL THEN
     RAISE EXCEPTION 'p_church_id is required';
+  END IF;
+
+  -- Tenant guard: prevent cross-tenant event creation
+  IF auth.uid() IS NOT NULL AND p_church_id IS DISTINCT FROM church.my_tenant_id() THEN
+    RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
   END IF;
 
   v_name := COALESCE(p_name, (
@@ -925,6 +981,11 @@ BEGIN
 
   IF v_event.id IS NULL THEN
     RAISE EXCEPTION 'Event not found';
+  END IF;
+
+  -- Tenant guard: prevent cross-tenant check-in
+  IF auth.uid() IS NOT NULL AND v_event.church_id IS DISTINCT FROM church.my_tenant_id() THEN
+    RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
   END IF;
 
   -- Ensure member is in the same tenant
@@ -1048,7 +1109,14 @@ RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 AS $$
+DECLARE
+  v_church_id uuid;
 BEGIN
+  SELECT church_id INTO v_church_id FROM church.events WHERE id = p_event_id;
+  IF auth.uid() IS NOT NULL AND v_church_id IS DISTINCT FROM church.my_tenant_id() THEN
+    RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
+  END IF;
+
   DELETE FROM church.attendance_logs
   WHERE member_id = p_member_id AND event_id = p_event_id;
 END;
@@ -1065,6 +1133,10 @@ DECLARE
   v_count integer := 0;
 BEGIN
   IF p_church_id IS NOT NULL THEN
+    IF auth.uid() IS NOT NULL AND p_church_id IS DISTINCT FROM church.my_tenant_id() THEN
+      RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
+    END IF;
+
     -- Remove existing open flags for this church/type/members that are no longer inactive
     DELETE FROM church.attendance_flags f
     USING church.members m
@@ -1152,8 +1224,10 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION church.process_inactive_30_days(uuid) TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION church.refresh_inactive_30_days(uuid) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION church.process_inactive_30_days(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.process_inactive_30_days(uuid) TO service_role;
+REVOKE EXECUTE ON FUNCTION church.refresh_inactive_30_days(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.refresh_inactive_30_days(uuid) TO service_role;
 
 -- Usher Passkey Validation
 CREATE OR REPLACE FUNCTION church.validate_usher_passkey(
@@ -1196,14 +1270,22 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION church.validate_usher_passkey(text, text) TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION public.validate_usher_passkey(text, text) TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION church.get_or_create_event(uuid, church.event_service_type, date, time, text, text, uuid) TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION church.check_in_member_manual(uuid, uuid, church.attendance_status, timestamptz, text, uuid) TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION church.check_in_member_manual_by_date(uuid, church.event_service_type, date, uuid, church.attendance_status, timestamptz, text) TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION church.increment_event_attendance(uuid) TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION church.decrement_event_attendance(uuid) TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION church.remove_attendance_manual(uuid, uuid) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION church.validate_usher_passkey(text, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.validate_usher_passkey(text, text) TO service_role;
+REVOKE EXECUTE ON FUNCTION public.validate_usher_passkey(text, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.validate_usher_passkey(text, text) TO service_role;
+REVOKE EXECUTE ON FUNCTION church.get_or_create_event(uuid, church.event_service_type, date, time, text, text, uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.get_or_create_event(uuid, church.event_service_type, date, time, text, text, uuid) TO service_role;
+REVOKE EXECUTE ON FUNCTION church.check_in_member_manual(uuid, uuid, church.attendance_status, timestamptz, text, uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.check_in_member_manual(uuid, uuid, church.attendance_status, timestamptz, text, uuid) TO service_role;
+REVOKE EXECUTE ON FUNCTION church.check_in_member_manual_by_date(uuid, church.event_service_type, date, uuid, church.attendance_status, timestamptz, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.check_in_member_manual_by_date(uuid, church.event_service_type, date, uuid, church.attendance_status, timestamptz, text) TO service_role;
+REVOKE EXECUTE ON FUNCTION church.increment_event_attendance(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.increment_event_attendance(uuid) TO service_role;
+REVOKE EXECUTE ON FUNCTION church.decrement_event_attendance(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.decrement_event_attendance(uuid) TO service_role;
+REVOKE EXECUTE ON FUNCTION church.remove_attendance_manual(uuid, uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.remove_attendance_manual(uuid, uuid) TO service_role;
 
 -- Follow-up Processor for Inactivity
 CREATE OR REPLACE FUNCTION church.process_inactive_30_days_followups(p_church_id uuid DEFAULT NULL)
@@ -1215,6 +1297,9 @@ DECLARE
   v_now timestamptz := now();
   v_count integer := 0;
 BEGIN
+  IF p_church_id IS NOT NULL AND auth.uid() IS NOT NULL AND p_church_id IS DISTINCT FROM church.my_tenant_id() THEN
+    RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
+  END IF;
   -- 1) Resolve any followed_up/open that has returned (present/late in last 30 days)
   WITH returned AS (
     SELECT DISTINCT al.church_id, al.member_id
@@ -1280,7 +1365,8 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION church.process_inactive_30_days_followups(uuid) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION church.process_inactive_30_days_followups(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.process_inactive_30_days_followups(uuid) TO service_role;
 
 -- Enable pg_cron
 CREATE EXTENSION IF NOT EXISTS pg_cron;

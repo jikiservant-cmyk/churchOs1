@@ -15,9 +15,48 @@ function getJwtSecret(): Uint8Array {
   return new TextEncoder().encode(jwtSecretValue);
 }
 
+// In-memory throttling map to prevent brute-force attacks on usher passkeys (max 5 failed attempts per 60s)
+const failedAttemptsMap = new Map<string, { count: number; resetTime: number }>();
+
+function checkUsherRateLimit(key: string): { allowed: boolean; retryAfter?: number } {
+  const now = Date.now();
+  const record = failedAttemptsMap.get(key);
+  if (!record || now > record.resetTime) {
+    return { allowed: true };
+  }
+  if (record.count >= 5) {
+    const retryAfter = Math.ceil((record.resetTime - now) / 1000);
+    return { allowed: false, retryAfter };
+  }
+  return { allowed: true };
+}
+
+function recordUsherFailedAttempt(key: string) {
+  const now = Date.now();
+  const record = failedAttemptsMap.get(key);
+  if (!record || now > record.resetTime) {
+    failedAttemptsMap.set(key, { count: 1, resetTime: now + 60 * 1000 });
+  } else {
+    record.count += 1;
+  }
+}
+
+function resetUsherAttempts(key: string) {
+  failedAttemptsMap.delete(key);
+}
+
 export async function validateUsherPasskey(churchSlug: string, passkey: string) {
   try {
-    console.log('[validateUsherPasskey] Validating for slug:', churchSlug);
+    const normalizedSlug = churchSlug.toLowerCase().trim();
+    const rateLimit = checkUsherRateLimit(normalizedSlug);
+    if (!rateLimit.allowed) {
+      return { 
+        success: false, 
+        error: `Too many failed attempts. Please wait ${rateLimit.retryAfter}s before trying again.` 
+      };
+    }
+
+    console.log('[validateUsherPasskey] Validating for slug:', normalizedSlug);
     const supabase = await createAdminClient();
     
     // Use ilike logic or explicit lowercase to ensure slug matches even if URL is mixed case
@@ -25,7 +64,7 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
       .schema('church')
       .from('churches')
       .select('id, name, passkey')
-      .ilike('slug', churchSlug)
+      .ilike('slug', normalizedSlug)
       .maybeSingle();
 
     if (!church) {
@@ -34,8 +73,12 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
     }
 
     if (church.passkey?.toUpperCase() !== passkey.toUpperCase()) {
+      recordUsherFailedAttempt(normalizedSlug);
       return { success: false, error: 'Invalid passkey. Please check and try again.' };
     }
+
+    // Reset attempts upon successful verification
+    resetUsherAttempts(normalizedSlug);
 
     const churchId = church.id;
     const churchName = church.name;
@@ -141,11 +184,11 @@ export async function createEvent(formData: FormData, churchId: string, churchSl
 
 export async function updateEventStatus(eventId: string, status: 'upcoming' | 'active' | 'completed', churchSlug: string) {
   try {
-    const supabase = await createClient();
+    // 1. Authorize caller first (ensures event belongs to church and caller has admin/usher rights)
+    const { adminClient } = await checkAuthorization(churchSlug, eventId);
     
     // Auto-mark absentees when an event is finalized
     if (status === 'completed') {
-      const adminClient = await createAdminClient();
       const { data: event } = await adminClient.schema('church').from('events').select('church_id').eq('id', eventId).single();
       
       if (event) {
@@ -178,7 +221,7 @@ export async function updateEventStatus(eventId: string, status: 'upcoming' | 'a
       }
     }
 
-    const { error } = await supabase
+    const { error } = await adminClient
       .schema('church')
       .from('events')
       .update({ status })
@@ -190,33 +233,8 @@ export async function updateEventStatus(eventId: string, status: 'upcoming' | 'a
     revalidatePath(`/${churchSlug}/admin/attendance/${eventId}`);
     revalidatePath(`/${churchSlug}/usher/dashboard`);
     return { success: true };
-  } catch (error) {
-    return { error: 'A network or server error occurred.' };
-  }
-}
-
-export async function claimAdminAccess(churchId: string, churchSlug: string) {
-  try {
-    const supabase = await createClient();
-    const { data: { user } } = await supabase.auth.getUser();
-    
-    if (!user) return { error: 'Not authenticated' };
-    
-    const adminSupabase = await createAdminClient();
-    const { error } = await adminSupabase.from('admin_profiles').upsert({
-      id: user.id,
-      tenant_id: churchId,
-      email: user.email,
-      role: 'pastor',
-      full_name: user.user_metadata?.full_name || user.email?.split('@')[0] || 'Admin'
-    });
-
-    if (error) return { error: error.message };
-
-    revalidatePath(`/${churchSlug}/admin/attendance`);
-    return { success: true };
-  } catch (error) {
-    return { error: 'Failed to claim access.' };
+  } catch (error: any) {
+    return { error: error?.message || 'A network or server error occurred.' };
   }
 }
 
@@ -431,6 +449,19 @@ export async function removeAttendance(churchSlug: string, eventId: string, memb
 
 export async function runInactivityDetection(churchId: string, churchSlug: string) {
   const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { error: 'Not authenticated' };
+
+  const { data: profile } = await supabase
+    .from('admin_profiles')
+    .select('tenant_id')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  if (!profile || profile.tenant_id !== churchId) {
+    return { error: 'Access denied' };
+  }
+
   const { data, error } = await supabase
     .schema('church')
     .rpc('refresh_inactive_30_days', { p_church_id: churchId });
@@ -443,6 +474,19 @@ export async function runInactivityDetection(churchId: string, churchSlug: strin
 
 export async function getAttendanceFlags(churchId: string) {
   const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { error: 'Not authenticated' };
+
+  const { data: profile } = await supabase
+    .from('admin_profiles')
+    .select('tenant_id')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  if (!profile || profile.tenant_id !== churchId) {
+    return { error: 'Access denied' };
+  }
+
   const { data, error } = await supabase
     .schema('church')
     .from('attendance_flags')
@@ -463,11 +507,25 @@ export async function getAttendanceFlags(churchId: string) {
 
 export async function updateAttendanceFlagStatus(flagId: string, status: AttendanceFlagStatus, churchSlug: string) {
   const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { error: 'Not authenticated' };
+
+  const { data: profile } = await supabase
+    .from('admin_profiles')
+    .select('tenant_id')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  if (!profile || !profile.tenant_id) {
+    return { error: 'Access denied' };
+  }
+
   const { error } = await supabase
     .schema('church')
     .from('attendance_flags')
     .update({ status })
-    .eq('id', flagId);
+    .eq('id', flagId)
+    .eq('church_id', profile.tenant_id);
 
   if (error) return { error: error.message };
   
@@ -478,10 +536,20 @@ export async function updateAttendanceFlagStatus(flagId: string, status: Attenda
 export async function sendMissedYouMessages(churchId: string, churchSlug: string, eventId?: string, customMessage?: string) {
   try {
     const supabase = await createClient();
-    const { data: { session } } = await supabase.auth.getSession();
+    const { data: { user } } = await supabase.auth.getUser();
     
-    if (!session) {
+    if (!user) {
       return { error: 'Not authenticated' };
+    }
+
+    const { data: profile } = await supabase
+      .from('admin_profiles')
+      .select('tenant_id')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (!profile || profile.tenant_id !== churchId) {
+      return { error: 'Access denied' };
     }
 
     // Sync the 3 consecutive Sundays missed flags by calling the deployed edge function

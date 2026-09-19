@@ -4,7 +4,7 @@ import { redirect, notFound } from 'next/navigation';
 import { revalidatePath } from 'next/cache';
 import { Plus, Calendar, Clock, MapPin, CheckCircle2, ChevronRight, Activity, AlertCircle } from 'lucide-react';
 import Link from 'next/link';
-import { createEvent, getAttendanceFlags, updateEventStatus, claimAdminAccess } from '@/lib/attendance-actions';
+import { createEvent, getAttendanceFlags, updateEventStatus } from '@/lib/attendance-actions';
 import { ChurchEvent } from '@/lib/attendance-types';
 import { InactivityRefreshButton } from '@/components/attendance/InactivityRefreshButton';
 import { AttendanceAlerts } from '@/components/attendance/AttendanceAlerts';
@@ -98,24 +98,16 @@ export default async function AttendancePage(props: {
       {/* Action Bar */}
       <CreateEventForm churchId={church.id} churchSlug={church_slug} />
 
-      {/* Admin Status Debug */}
+      {/* Admin Status Notice */}
       {!adminProfile && user && (
-        <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl space-y-3 text-amber-800">
+        <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl space-y-1 text-amber-800">
           <div className="flex items-center gap-3">
-            <AlertCircle className="w-5 h-5" />
+            <AlertCircle className="w-5 h-5 flex-shrink-0" />
             <div>
-              <p className="font-bold">Access Warning</p>
-              <p className="text-[13px]">You are logged in as <span className="font-mono text-[11px]">{user?.email || 'authenticated user'}</span>, but you aren&apos;t registered as an admin for this church.</p>
+              <p className="font-bold text-sm">Access Notice</p>
+              <p className="text-[13px]">You are logged in as <span className="font-mono text-[11px]">{user?.email || 'authenticated user'}</span> without an active administrator role for this church.</p>
             </div>
           </div>
-          <form action={async () => {
-            'use server';
-            await claimAdminAccess(church.id, church_slug);
-          }}>
-            <button type="submit" className="text-[11px] font-bold uppercase tracking-widest bg-amber-200 hover:bg-amber-300 px-4 py-2 rounded-lg transition-colors">
-              Claim Admin Access for this Church
-            </button>
-          </form>
         </div>
       )}
 

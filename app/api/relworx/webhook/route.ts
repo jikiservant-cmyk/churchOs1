@@ -38,6 +38,12 @@ export async function POST(req: Request) {
 
     // 2. Handle Success
     if (status === 'success') {
+      const incomingAmount = Math.floor(Number(amount));
+      if (isNaN(incomingAmount) || incomingAmount < transaction.amount) {
+        console.error(`[Relworx Webhook] Underpayment detected! Expected ${transaction.amount}, got ${incomingAmount}`);
+        return NextResponse.json({ error: 'Amount mismatch' }, { status: 400 });
+      }
+
       // Update transaction status
       const { error: updateTxError } = await supabase
         .from('wallet_transactions')
@@ -52,10 +58,10 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: 'Database update failed' }, { status: 500 });
       }
 
-      // Increment wallet balance
+      // Increment wallet balance using verified database amount
       const { error: rpcError } = await supabase.rpc('increment_wallet_balance', {
         p_tenant_id: transaction.tenant_id,
-        p_amount: Math.floor(amount)
+        p_amount: transaction.amount
       });
 
       if (rpcError) {

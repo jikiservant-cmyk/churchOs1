@@ -3,6 +3,7 @@
 import { createClient, createAdminClient } from '@/lib/supabase/server';
 import { revalidatePath } from 'next/cache';
 import { normalizeUgPhone } from './utils';
+import crypto from 'crypto';
 
 // Helper to format phone for Najiki (E.164 without plus or 256...)
 function formatPhoneForNajiki(phone: string): string {
@@ -27,9 +28,26 @@ export async function initiateNajikiPayment(formData: FormData) {
 
     console.log('[Najiki] Initiation started');
 
-    if (!churchId || !phoneNumber || isNaN(amount)) {
+    if (!churchId || !phoneNumber || isNaN(amount) || amount <= 0) {
       console.error('[Najiki] Missing or invalid required fields for payment');
       return { error: 'Missing or invalid required fields' };
+    }
+
+    // Verify authenticated user owns this church
+    const supabase = await createClient();
+    const { data: { user }, error: authError } = await supabase.auth.getUser();
+    if (authError || !user) {
+      return { error: 'Unauthorized: authentication required' };
+    }
+
+    const { data: profile } = await supabase
+      .from('admin_profiles')
+      .select('tenant_id')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (!profile || profile.tenant_id !== churchId) {
+      return { error: 'Access denied: cannot initiate payment for another church' };
     }
 
     const apiKey = process.env.NAJIKI_API_KEY;
@@ -91,8 +109,9 @@ export async function initiateNajikiPayment(formData: FormData) {
       return { error: 'Wallet record missing for church' };
     }
 
-    // 2. Create a pending transaction in our DB
-    const reference = `CHURCH-${Date.now()}-${Math.random().toString(36).substring(7).toUpperCase()}`;
+    // 2. Create a pending transaction in our DB with high-entropy cryptographic references
+    const reference = `CHURCH-${crypto.randomUUID()}`;
+    const idempotencyKey = `ik_church_${crypto.randomUUID()}`;
 
     const { error: txError } = await supabaseAdmin.from('wallet_transactions').insert({
       tenant_id: churchId,
@@ -100,9 +119,10 @@ export async function initiateNajikiPayment(formData: FormData) {
       amount: amount,
       direction: 'credit',
       currency: 'UGX',
-      type: 'sms_topup',
+      type: 'TOPUP',
       description: `Najiki Top-up for ${phoneNumber}`,
-      reference: reference,
+      reference_code: reference,
+      idempotency_key: idempotencyKey,
       status: 'pending',
       note: 'pending'
     });
@@ -118,8 +138,6 @@ export async function initiateNajikiPayment(formData: FormData) {
     const formattedPhone = formatPhoneForNajiki(phoneNumber);
 
     // 4. Call Najiki API
-    const idempotencyKey = `ik_church_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
-
     const requestBody = {
       applicationCode: applicationCode || 'church',
       tenantCode: tenantCode,

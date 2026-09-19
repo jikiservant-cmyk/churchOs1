@@ -40,8 +40,9 @@ export async function middleware(request: NextRequest) {
     const url = new URL(request.url);
     const pathParts = url.pathname.split('/');
     
-    // Check if we are in an admin route: /[slug]/admin/...
-    if (pathParts.length >= 3 && pathParts[2] === 'admin' && pathParts[3] !== 'login') {
+    // Check if we are in an admin route: /c/[slug]/admin/... or /[slug]/admin/...
+    const isAdminRoute = pathParts.includes('admin') && !url.pathname.includes('/admin/login');
+    if (isAdminRoute) {
       if (!user) {
         return NextResponse.redirect(new URL(`/?error=Session Expired`, request.url));
       }

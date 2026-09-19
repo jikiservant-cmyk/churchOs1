@@ -13,11 +13,12 @@ export const getChurchBySlug = async (slug: string): Promise<Church | null> => {
   if (process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
     try {
       const supabase = await createAdminClient();
+      const normalizedSlug = slug.toLowerCase().trim();
       const { data, error } = await supabase
         .schema('church')
         .from('churches')
-        .select('*')
-        .ilike('slug', slug)
+        .select('id, name, slug, theme_color, logo_url')
+        .ilike('slug', normalizedSlug)
         .maybeSingle();
 
       if (error) {

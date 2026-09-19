@@ -1,9 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
+import { createClient } from '@/lib/supabase/server';
 
 export async function POST(req: NextRequest) {
   try {
-    const { phoneNumber, amount, description } = await req.json();
+    const supabase = await createClient();
+    const { data: { user }, error: authError } = await supabase.auth.getUser();
+
+    if (authError || !user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { phoneNumber, amount, description, churchId } = await req.json();
 
     // Validate required fields
     if (!phoneNumber || !amount || !description) {
@@ -11,6 +19,30 @@ export async function POST(req: NextRequest) {
         { error: 'Missing required fields: phoneNumber, amount, description' },
         { status: 400 }
       );
+    }
+
+    // Verify tenant ownership
+    if (churchId) {
+      const { data: adminProfile } = await supabase
+        .from('admin_profiles')
+        .select('tenant_id')
+        .eq('id', user.id)
+        .eq('tenant_id', churchId)
+        .maybeSingle();
+
+      if (!adminProfile) {
+        return NextResponse.json({ error: 'Forbidden: Access denied for this church' }, { status: 403 });
+      }
+    } else {
+      const { data: adminProfile } = await supabase
+        .from('admin_profiles')
+        .select('tenant_id')
+        .eq('id', user.id)
+        .maybeSingle();
+
+      if (!adminProfile) {
+        return NextResponse.json({ error: 'Forbidden: No tenant profile found' }, { status: 403 });
+      }
     }
 
     const apiKey = process.env.LIVEPAY_API_KEY;

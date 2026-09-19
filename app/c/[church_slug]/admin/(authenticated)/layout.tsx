@@ -32,12 +32,13 @@ export default async function AdminLayout({
     .eq('id', user.id)
     .maybeSingle();
 
-  if (!profile || profile.role !== 'pastor') {
+  // Role and Tenant Check (fail closed if no tenant_id assigned)
+  if (!profile || profile.role !== 'pastor' || !profile.tenant_id) {
     redirect(`/?error=Access Denied`);
   }
 
-  // Church Mismatch Check - Simplified to just one potential redirect
-  if (profile.tenant_id && church.id !== profile.tenant_id) {
+  // Church Mismatch Check
+  if (church.id !== profile.tenant_id) {
     const { data: correctChurch } = await supabase
       .schema('church')
       .from('churches')
