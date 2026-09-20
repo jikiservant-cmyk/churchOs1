@@ -100,9 +100,9 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
     }
 
     const providedPasskey = (passkey || '').trim();
-    if (!providedPasskey || providedPasskey.length < 8 || !/^[A-Za-z0-9_-]+$/.test(providedPasskey)) {
+    if (!providedPasskey || providedPasskey.length < 6 || providedPasskey.length > 32 || !/^[A-Za-z0-9_-]+$/.test(providedPasskey)) {
       recordUsherFailedAttempt(canonicalSlug);
-      return { success: false, error: 'Invalid passkey.' };
+      return { success: false, error: 'Invalid passkey format.' };
     }
 
     const providedHash = computePasskeyHash(providedPasskey);
@@ -829,12 +829,16 @@ export async function sendMissedYouMessages(churchId: string, churchSlug: string
         : defaultMessage;
       
       try {
+        // Deterministic idempotency key per event/date to prevent double-billing on retries
+        const eventKeyPart = targetEventId ? targetEventId.slice(0, 8) : new Date().toISOString().slice(0, 10);
+        const deterministicKey = `missed_${churchId.slice(0, 8)}_${eventKeyPart}_${member.id.slice(0, 8)}`;
+
         const result = await sendSingleSMS({
           supabase,
           phoneNumber: member.phone_number,
           message,
           churchId,
-          idempotencyKey: `missed_${churchId.slice(0, 8)}_${member.id}_${Date.now()}`,
+          idempotencyKey: deterministicKey,
           senderId,
           balance: freshBalance
         });

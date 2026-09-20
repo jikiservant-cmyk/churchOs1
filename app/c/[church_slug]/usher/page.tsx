@@ -55,18 +55,18 @@ export default function UsherEntryPage({ params }: { params: Promise<{ church_sl
               <KeyRound className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-[#9A7E65] opacity-50" />
               <input
                 type="text"
-                maxLength={6}
+                maxLength={12}
                 value={passkey}
-                onChange={(e) => setPasskey(e.target.value.replace(/[^a-zA-Z0-9]/g, '').toUpperCase())}
-                placeholder="XXXXXX"
-                className="w-full pl-12 pr-4 py-4 bg-[#FAF7F0] border-2 border-transparent rounded-2xl text-2xl font-black text-center tracking-[0.5em] focus:border-[#B5622A] focus:bg-white outline-none transition-all placeholder:text-[#E9E1D2] placeholder:tracking-normal uppercase"
+                onChange={(e) => setPasskey(e.target.value.replace(/[^a-zA-Z0-9_-]/g, '').toUpperCase())}
+                placeholder="PASSKEY"
+                className="w-full pl-12 pr-4 py-4 bg-[#FAF7F0] border-2 border-transparent rounded-2xl text-2xl font-black text-center tracking-[0.25em] focus:border-[#B5622A] focus:bg-white outline-none transition-all placeholder:text-[#E9E1D2] placeholder:tracking-normal uppercase"
                 autoFocus
               />
             </div>
             
             <button
               type="submit"
-              disabled={isLoading || passkey.length < 4}
+              disabled={isLoading || passkey.length < 6}
               className="w-full bg-[#B5622A] text-white py-4 rounded-2xl font-black text-[14px] uppercase tracking-widest shadow-lg shadow-[#B5622A]/20 hover:bg-[#944F22] transition-all disabled:opacity-50 disabled:shadow-none flex items-center justify-center gap-3"
             >
               {isLoading ? (

@@ -47,25 +47,30 @@ export async function tenantScopedAdmin(tenantId: string) {
     },
 
     /**
-     * Query a table in the church schema, automatically applying church_id filter
+     * Query a table in the church schema, automatically applying the correct tenant filter.
+     * Tables with 'tenant_id': sms_logs, broadcasts, sms_queue.
+     * Tables with 'church_id': members, events, attendance_logs, attendance_flags, visitors, new_converts, etc.
      */
     church<T = any>(table: string) {
+      const TENANT_ID_TABLES = new Set(['sms_logs', 'broadcasts', 'sms_queue']);
+      const tenantColumn = TENANT_ID_TABLES.has(table) ? 'tenant_id' : 'church_id';
       const query = admin.schema('church').from(table);
+
       return {
         select(columns = '*') {
-          return query.select(columns).eq('church_id', cleanTenantId) as any;
+          return query.select(columns).eq(tenantColumn, cleanTenantId) as any;
         },
         insert(values: Record<string, any> | Array<Record<string, any>>) {
           const boundValues = Array.isArray(values)
-            ? values.map(v => ({ ...v, church_id: cleanTenantId }))
-            : { ...values, church_id: cleanTenantId };
+            ? values.map(v => ({ ...v, [tenantColumn]: cleanTenantId }))
+            : { ...values, [tenantColumn]: cleanTenantId };
           return query.insert(boundValues as any);
         },
         update(values: Record<string, any>) {
-          return query.update(values).eq('church_id', cleanTenantId);
+          return query.update(values).eq(tenantColumn, cleanTenantId);
         },
         delete() {
-          return query.delete().eq('church_id', cleanTenantId);
+          return query.delete().eq(tenantColumn, cleanTenantId);
         },
         raw() {
           return query;
