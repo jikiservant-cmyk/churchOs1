@@ -11,6 +11,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
+    const { data: profile } = await supabase
+      .from('admin_profiles')
+      .select('tenant_id, role')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (!profile?.tenant_id) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
     const { prompt, context } = await req.json();
 
     if (!prompt) {

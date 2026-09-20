@@ -22,13 +22,18 @@ function formatPhoneForNajiki(phone: string): string {
 export async function initiateNajikiPayment(formData: FormData) {
   try {
     const churchId = formData.get('churchId') as string;
-    const amountStr = formData.get('amount') as string;
-    const amount = parseInt(amountStr, 10);
+    // F-06: never trust a client-supplied amount. Price server-side and cap it.
+    const rawAmount = parseInt(String(formData.get('amount') ?? ''), 10);
+    const TOPUP_MIN = 1_000, TOPUP_MAX = 2_000_000;
+    if (!Number.isFinite(rawAmount) || rawAmount < TOPUP_MIN || rawAmount > TOPUP_MAX) {
+      return { error: `Top-up must be between ${TOPUP_MIN} and ${TOPUP_MAX} UGX` };
+    }
+    const amount = rawAmount; // amount now means UGX received, nothing else
     const phoneNumber = formData.get('phoneNumber') as string;
 
     console.log('[Najiki] Initiation started');
 
-    if (!churchId || !phoneNumber || isNaN(amount) || amount <= 0) {
+    if (!churchId || !phoneNumber) {
       console.error('[Najiki] Missing or invalid required fields for payment');
       return { error: 'Missing or invalid required fields' };
     }
@@ -149,6 +154,8 @@ export async function initiateNajikiPayment(formData: FormData) {
       idempotencyKey: idempotencyKey,
       metadata: {
         churchId,
+        tenantCode,
+        product: 'sms_topup',
         source: 'admin-dashboard'
       }
     };

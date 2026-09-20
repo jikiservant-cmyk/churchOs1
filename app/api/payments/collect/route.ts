@@ -22,28 +22,21 @@ export async function POST(req: NextRequest) {
     }
 
     // Verify tenant ownership
-    if (churchId) {
-      const { data: adminProfile } = await supabase
-        .from('admin_profiles')
-        .select('tenant_id')
-        .eq('id', user.id)
-        .eq('tenant_id', churchId)
-        .maybeSingle();
+    const { data: adminProfile } = await supabase
+      .from('admin_profiles')
+      .select('tenant_id')
+      .eq('id', user.id)
+      .maybeSingle();
 
-      if (!adminProfile) {
-        return NextResponse.json({ error: 'Forbidden: Access denied for this church' }, { status: 403 });
-      }
-    } else {
-      const { data: adminProfile } = await supabase
-        .from('admin_profiles')
-        .select('tenant_id')
-        .eq('id', user.id)
-        .maybeSingle();
-
-      if (!adminProfile) {
-        return NextResponse.json({ error: 'Forbidden: No tenant profile found' }, { status: 403 });
-      }
+    if (!adminProfile?.tenant_id) {
+      return NextResponse.json({ error: 'Forbidden: No tenant profile found' }, { status: 403 });
     }
+
+    if (churchId && adminProfile.tenant_id !== churchId) {
+      return NextResponse.json({ error: 'Forbidden: Access denied for this church' }, { status: 403 });
+    }
+
+    const tenantId = churchId ?? adminProfile.tenant_id; // always tenant-attributed
 
     const apiKey = process.env.LIVEPAY_API_KEY;
     const accountNumber = process.env.LIVEPAY_ACCOUNT_NO; // matches .env.example exactly

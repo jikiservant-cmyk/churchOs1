@@ -92,7 +92,7 @@ export async function POST(req: Request) {
       }, { status: 402 });
     }
 
-    // 4. Validate Input
+    // 4. Validate Input & Normalize Ugandan Phone
     if (!phoneNumber || !message) {
       return NextResponse.json(
         { error: 'Missing required fields: phoneNumber or message' },
@@ -100,18 +100,37 @@ export async function POST(req: Request) {
       );
     }
 
-    // 5. Determine Sender ID
+    const normalizedPhone = normalizeUgPhone(phoneNumber);
+    if (!normalizedPhone) {
+      return NextResponse.json(
+        { error: 'Invalid Ugandan phone number format.' },
+        { status: 400 }
+      );
+    }
+
+    // 5. Verify recipient belongs to this church (member or new_convert) if recipientId provided, or check phone
+    if (body.recipientId) {
+      const [mCheck, cCheck] = await Promise.all([
+        supabaseUserClient.schema('church').from('members').select('id, phone_number').eq('id', body.recipientId).eq('church_id', churchId).maybeSingle(),
+        supabaseUserClient.schema('church').from('new_converts').select('id, phone_number').eq('id', body.recipientId).eq('church_id', churchId).maybeSingle()
+      ]);
+      if (!mCheck.data && !cCheck.data) {
+        return NextResponse.json({ error: 'Recipient does not belong to this church.' }, { status: 403 });
+      }
+    }
+
+    // 6. Determine Sender ID
     const isSandbox = process.env.AT_USERNAME?.toLowerCase() === 'sandbox';
     let senderId = '';
     if (!isSandbox && authorizedChurch.sender_id && authorizedChurch.sender_id.trim() !== '') {
        senderId = authorizedChurch.sender_id.trim();
     }
 
-    // 6. Use the shared sending logic
+    // 7. Use the shared sending logic
     try {
       const result = await sendSingleSMS({
         supabase: supabaseUserClient,
-        phoneNumber,
+        phoneNumber: normalizedPhone,
         message,
         churchId,
         idempotencyKey: body.idempotencyKey,

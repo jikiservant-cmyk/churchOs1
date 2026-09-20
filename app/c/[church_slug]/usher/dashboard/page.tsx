@@ -1,7 +1,7 @@
 import { Metadata } from 'next';
 import { redirect } from 'next/navigation';
 import { getUsherSession } from '@/lib/attendance-actions';
-import { createAdminClient } from '@/lib/supabase/server';
+import { tenantScopedAdmin } from '@/lib/supabase/tenant-scoped';
 import { UsherDashboardClient } from '@/components/attendance/UsherDashboardClient';
 import { LogOut, Activity } from 'lucide-react';
 import Link from 'next/link';
@@ -19,36 +19,31 @@ export default async function UsherDashboard({ params }: { params: Promise<{ chu
     redirect(`/${church_slug}/usher`);
   }
 
-  // Use Admin Client to bypass RLS since ushers are authenticated via custom passkey session
-  const supabase = await createAdminClient();
+  // F-13: Use tenantScopedAdmin to bind all operations strictly to session.church_id
+  const scopedDb = await tenantScopedAdmin(session.church_id);
 
   // 1. Get today's active event or create it
-  const { data: activeEvents } = await supabase
-    .schema('church')
-    .from('events')
-    .select('*')
-    .eq('church_id', session.church_id)
+  const { data: activeEvents } = await (scopedDb
+    .church('events')
+    .select('*') as any)
     .eq('status', 'active')
     .order('event_date', { ascending: false })
     .limit(1);
 
-  const activeEvent = activeEvents?.[0];
+  const activeEvent = (activeEvents as any)?.[0];
 
   // 2. Fetch members for this church
-  const { data: members } = await supabase
-    .schema('church')
-    .from('members')
-    .select('*')
-    .eq('church_id', session.church_id)
+  const { data: members } = await (scopedDb
+    .church('members')
+    .select('*') as any)
     .order('full_name', { ascending: true });
 
   // 3. Fetch attendance logs for the active event
   let attendanceLogs: any[] = [];
   if (activeEvent) {
-    const { data: logs } = await supabase
-      .schema('church')
-      .from('attendance_logs')
-      .select('member_id, attendance_status')
+    const { data: logs } = await (scopedDb
+      .church('attendance_logs')
+      .select('member_id, attendance_status') as any)
       .eq('event_id', activeEvent.id)
       .in('attendance_status', ['present', 'late']);
     attendanceLogs = logs || [];

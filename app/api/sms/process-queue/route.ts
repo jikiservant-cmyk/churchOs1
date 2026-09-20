@@ -63,9 +63,20 @@ export async function POST(req: Request) {
   }
 
   try {
-    const body       = await req.json().catch(() => ({}));
-    const tenantId   = (body?.churchId as string | undefined) ?? undefined;
-    const batchSize  = Math.min(Number(body?.batchSize ?? 15), 20); // cap at 20
+    const body      = await req.json().catch(() => ({}));
+    const batchSize = Math.min(Math.max(Number(body?.batchSize ?? 15) || 15, 1), 20);
+
+    // F-11: the secret authorises "process the queue", not "process any tenant".
+    // Per-tenant triggers must carry their own scoped token (or an authenticated
+    // pastor/admin session whose tenant is used instead of a body field).
+    const tenantId = req.headers.get('x-queue-tenant') ?? undefined;
+    if (tenantId) {
+      const expected = process.env[`QUEUE_SECRET_${tenantId.toUpperCase()}`] || process.env.QUEUE_PROCESSOR_SECRET;
+      const provided = req.headers.get('x-queue-secret');
+      if (!expected || provided !== expected) {
+        return NextResponse.json({ error: 'Unauthorized for tenant' }, { status: 401 });
+      }
+    }
 
     const result = await processQueueBatch({ tenantId, batchSize });
 

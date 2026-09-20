@@ -17,6 +17,7 @@
 import { normalizeUgPhone } from '@/lib/utils';
 import { sendSingleSMS } from '@/lib/sms-actions';
 import { createAdminClient } from '@/lib/supabase/server';
+import { tenantScopedAdmin } from '@/lib/supabase/tenant-scoped';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -70,14 +71,12 @@ export interface ProcessResult {
 export async function enqueueBroadcast(
   params: EnqueueBroadcastParams,
 ): Promise<EnqueueResult> {
-  const admin = await createAdminClient();
+  const scopedDb = await tenantScopedAdmin(params.tenantId);
 
   // 1. Create the parent broadcast record
-  const { data: broadcast, error: broadcastErr } = await admin
-    .schema('church')
-    .from('broadcasts')
+  const { data: broadcast, error: broadcastErr } = await scopedDb
+    .church('broadcasts')
     .insert({
-      tenant_id:        params.tenantId,
       message_template: params.message,
       audience:         params.audience ?? 'all',
       total_recipients: params.recipients.length,  // refined below after filtering
@@ -121,9 +120,8 @@ export async function enqueueBroadcast(
   // 3. Insert in batches of 100 (PostgREST body-size sweet spot)
   const BATCH = 100;
   for (let i = 0; i < rows.length; i += BATCH) {
-    const { error: insertErr } = await admin
-      .schema('church')
-      .from('sms_queue')
+    const { error: insertErr } = await scopedDb
+      .church('sms_queue')
       .insert(rows.slice(i, i + BATCH));
 
     if (insertErr) {
@@ -132,9 +130,8 @@ export async function enqueueBroadcast(
   }
 
   // 4. Correct total_recipients to the actual enqueued count
-  await admin
-    .schema('church')
-    .from('broadcasts')
+  await scopedDb
+    .church('broadcasts')
     .update({ total_recipients: rows.length, updated_at: new Date().toISOString() })
     .eq('id', broadcast.id);
 
@@ -295,14 +292,12 @@ export async function getBroadcastStatus(
   broadcastId: string,
   tenantId: string,
 ): Promise<BroadcastStatus | null> {
-  const admin = await createAdminClient();
+  const scopedDb = await tenantScopedAdmin(tenantId);
 
-  const { data } = await admin
-    .schema('church')
-    .from('broadcasts')
+  const { data } = await scopedDb
+    .church('broadcasts')
     .select('id, status, total_recipients, sent_count, failed_count, created_at, completed_at')
     .eq('id', broadcastId)
-    .eq('tenant_id', tenantId)
     .maybeSingle();
 
   if (!data) return null;

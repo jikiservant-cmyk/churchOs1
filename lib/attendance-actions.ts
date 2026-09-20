@@ -1,6 +1,7 @@
 'use server';
 
 import { createClient, createAdminClient } from '@/lib/supabase/server';
+import { tenantScopedAdmin } from '@/lib/supabase/tenant-scoped';
 import { revalidatePath } from 'next/cache';
 import { cookies } from 'next/headers';
 import { ChurchEvent, AttendanceLog, AttendanceFlag, AttendanceFlagStatus } from './attendance-types';
@@ -10,11 +11,13 @@ import { sendSingleSMS } from './sms-actions';
 import crypto from 'crypto';
 
 function getJwtSecret(): Uint8Array {
-  const jwtSecretValue = process.env.USHER_JWT_SECRET || process.env.SUPABASE_JWT_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!jwtSecretValue) {
-    throw new Error('No secret available to sign usher sessions.');
+  // F-04: no silent fallback to the service-role key. A dedicated secret is now
+  // mandatory, which is what makes rotation and revocation auditable.
+  const jwtSecretValue = process.env.USHER_JWT_SECRET;
+  if (!jwtSecretValue || jwtSecretValue === 'REPLACE_ME_WITH_A_STRONG_RANDOM_SECRET') {
+    throw new Error('USHER_JWT_SECRET is not configured. Usher sessions are disabled until it is set.');
   }
-  // Domain-separate the usher secret to prevent raw key reuse with the service role key
+  // Domain-separate the usher secret to prevent raw key reuse
   const derivedSecret = crypto.createHmac('sha256', 'usher_jwt_domain_separation').update(jwtSecretValue).digest();
   return derivedSecret;
 }
@@ -97,9 +100,9 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
     }
 
     const providedPasskey = (passkey || '').trim();
-    if (!providedPasskey || providedPasskey.length < 4) {
+    if (!providedPasskey || providedPasskey.length < 8 || !/^[A-Za-z0-9_-]+$/.test(providedPasskey)) {
       recordUsherFailedAttempt(canonicalSlug);
-      return { success: false, error: 'Invalid passkey. Passkey must be at least 4 characters.' };
+      return { success: false, error: 'Invalid passkey.' };
     }
 
     const providedHash = computePasskeyHash(providedPasskey);
@@ -118,12 +121,13 @@ export async function validateUsherPasskey(churchSlug: string, passkey: string) 
       const actualBuf = Buffer.from(providedPasskey);
       if (expectedBuf.length === actualBuf.length && crypto.timingSafeEqual(expectedBuf, actualBuf)) {
         isMatch = true;
-        // Upgrade database to store passkey_hash
+        // Upgrade database to store passkey_hash and wipe plaintext
         supabase
           .schema('church')
           .from('churches')
           .update({
             passkey_hash: providedHash,
+            passkey: null,
             passkey_version: church.passkey_version || 1
           })
           .eq('id', church.id)
@@ -284,30 +288,30 @@ export async function createEvent(formData: FormData, churchId: string, churchSl
 export async function updateEventStatus(eventId: string, status: 'upcoming' | 'active' | 'completed', churchSlug: string) {
   try {
     // 1. Authorize caller first (ensures event belongs to church and caller has admin/usher rights)
-    const { adminClient } = await checkAuthorization(churchSlug, eventId);
+    const { scopedDb, churchId } = await checkAuthorization(churchSlug, eventId);
     
     // Auto-mark absentees when an event is finalized
     if (status === 'completed') {
-      const { data: event } = await adminClient.schema('church').from('events').select('church_id').eq('id', eventId).single();
+      const { data: event } = await scopedDb.church('events').select('church_id').eq('id', eventId).single();
       
       if (event) {
-        const { data: allMembers } = await adminClient.schema('church').from('members').select('id').eq('church_id', event.church_id).eq('status', 'active');
-        const { data: logs } = await adminClient.schema('church').from('attendance_logs').select('member_id').eq('event_id', eventId);
+        const { data: allMembers } = await scopedDb.church('members').select('id').eq('status', 'active');
+        const { data: logs } = await scopedDb.church('attendance_logs').select('member_id').eq('event_id', eventId);
         
         if (allMembers && logs) {
-          const attendedIds = new Set(logs.map(l => l.member_id));
-          const absentMembers = allMembers.filter(m => !attendedIds.has(m.id));
+          const attendedIds = new Set((logs as any[]).map(l => l.member_id));
+          const absentMembers = (allMembers as any[]).filter(m => !attendedIds.has(m.id));
           
           if (absentMembers.length > 0) {
             const absentLogs = absentMembers.map(m => ({
-              church_id: event.church_id,
+              church_id: churchId,
               event_id: eventId,
               member_id: m.id,
               attendance_status: 'absent'
             }));
             
             // Use upsert to be safe and avoid unique constraint conflicts
-            const { error: insertError } = await adminClient
+            const { error: insertError } = await scopedDb.admin
               .schema('church')
               .from('attendance_logs')
               .upsert(absentLogs, { onConflict: 'member_id,event_id' });
@@ -320,9 +324,8 @@ export async function updateEventStatus(eventId: string, status: 'upcoming' | 'a
       }
     }
 
-    const { error } = await adminClient
-      .schema('church')
-      .from('events')
+    const { error } = await scopedDb
+      .church('events')
       .update({ status })
       .eq('id', eventId);
 
@@ -357,8 +360,8 @@ export async function updateChurchPasskey(churchId: string, newPasskey: string, 
     }
 
     const trimmedKey = newPasskey.trim();
-    if (trimmedKey.length < 4) {
-      return { error: 'Passkey must be at least 4 characters long.' };
+    if (trimmedKey.length < 8 || !/^[A-Za-z0-9_-]+$/.test(trimmedKey)) {
+      return { error: 'Passkey must be at least 8 characters long and contain only letters, numbers, hyphens, and underscores.' };
     }
 
     const passkeyHash = computePasskeyHash(trimmedKey);
@@ -373,12 +376,12 @@ export async function updateChurchPasskey(churchId: string, newPasskey: string, 
 
     const nextVersion = (church?.passkey_version || 1) + 1;
 
-    // MT-01 & MT-02 remediation: store hash, bump version to invalidate existing usher JWT sessions immediately
+    // F-04 & F-08 remediation: store hash, wipe plaintext, bump version to invalidate existing usher JWT sessions immediately
     const { error } = await adminSupabase
       .schema('church')
       .from('churches')
       .update({
-        passkey: trimmedKey,
+        passkey: null,
         passkey_hash: passkeyHash,
         passkey_version: nextVersion,
         passkey_updated_at: new Date().toISOString()
@@ -447,12 +450,15 @@ async function checkAuthorization(
   if (!event) {
     throw new Error('Event not found.');
   }
+
+  const churchId = event.church_id;
+  const scopedDb = await tenantScopedAdmin(churchId);
   
   // 1. Is there an usher session for this church?
   if (allowedRoles.includes('usher')) {
     const usherSession = await getUsherSession(churchSlug.toLowerCase());
-    if (usherSession && usherSession.church_slug === churchSlug.toLowerCase() && usherSession.church_id === event.church_id) {
-      return { adminClient, allowed: true, role: 'usher' };
+    if (usherSession && usherSession.church_slug === churchSlug.toLowerCase() && usherSession.church_id === churchId) {
+      return { scopedDb, churchId, allowed: true, role: 'usher' };
     }
   }
 
@@ -467,8 +473,8 @@ async function checkAuthorization(
       .eq('id', user.id)
       .maybeSingle();
 
-    if (profile && profile.tenant_id === event.church_id && allowedRoles.includes(profile.role)) {
-      return { adminClient, allowed: true, role: profile.role };
+    if (profile && profile.tenant_id === churchId && allowedRoles.includes(profile.role)) {
+      return { scopedDb, churchId, allowed: true, role: profile.role };
     }
   }
 
@@ -477,47 +483,32 @@ async function checkAuthorization(
 
 export async function markAttendance(churchSlug: string, eventId: string, memberId: string, status: 'present' | 'late' | 'absent' | 'excused' = 'present') {
   try {
-    const { adminClient: supabase } = await checkAuthorization(churchSlug, eventId);
-    
-    // 1. Get the church_id from the event first
-    const { data: eventData, error: eventError } = await supabase
-      .schema('church')
-      .from('events')
-      .select('church_id')
-      .eq('id', eventId)
-      .single();
+    const { scopedDb, churchId } = await checkAuthorization(churchSlug, eventId);
 
-    if (eventError || !eventData) {
-      throw new Error('Could not find event details.');
-    }
-
-    // 1b. Verify that the member belongs to this church (prevent cross-tenant attendance poisoning)
-    const { data: memberData, error: memberError } = await supabase
-      .schema('church')
-      .from('members')
+    // 1. Verify that the member belongs to this church (prevent cross-tenant attendance poisoning)
+    const { data: memberData, error: memberError } = await scopedDb
+      .church('members')
       .select('id')
       .eq('id', memberId)
-      .eq('church_id', eventData.church_id)
       .maybeSingle();
 
     if (memberError || !memberData) {
       throw new Error('Member does not belong to this church');
     }
 
-    // 2. Direct upsert into attendance_logs using Admin Client (bypasses RLS)
-    const { data: existingLog } = await supabase
-      .schema('church')
-      .from('attendance_logs')
+    // 2. Direct upsert into attendance_logs using tenant-scoped Admin Client
+    const { data: existingLog } = await scopedDb
+      .church('attendance_logs')
       .select('attendance_status')
       .eq('member_id', memberId)
       .eq('event_id', eventId)
       .maybeSingle();
 
-    const { error } = await supabase
+    const { error } = await scopedDb.admin
       .schema('church')
       .from('attendance_logs')
       .upsert({
-        church_id: eventData.church_id,
+        church_id: churchId,
         member_id: memberId,
         event_id: eventId,
         attendance_status: status,
@@ -534,9 +525,9 @@ export async function markAttendance(churchSlug: string, eventId: string, member
     const isPresent = status === 'present' || status === 'late';
 
     if (!wasPresent && isPresent) {
-      await supabase.schema('church').rpc('increment_event_attendance', { event_id: eventId });
+      await scopedDb.admin.schema('church').rpc('increment_event_attendance', { event_id: eventId });
     } else if (wasPresent && !isPresent) {
-      await supabase.schema('church').rpc('decrement_event_attendance', { event_id: eventId });
+      await scopedDb.admin.schema('church').rpc('decrement_event_attendance', { event_id: eventId });
     }
 
     revalidatePath(`/${churchSlug}/usher/dashboard`);
@@ -551,39 +542,24 @@ export async function markAttendance(churchSlug: string, eventId: string, member
 
 export async function removeAttendance(churchSlug: string, eventId: string, memberId: string) {
   try {
-    const { adminClient: supabase } = await checkAuthorization(churchSlug, eventId);
-    
-    // 1. Get event data to verify tenant scope
-    const { data: eventData } = await supabase
-      .schema('church')
-      .from('events')
-      .select('church_id')
-      .eq('id', eventId)
-      .single();
-
-    if (!eventData) throw new Error('Event not found');
+    const { scopedDb, churchId } = await checkAuthorization(churchSlug, eventId);
 
     // 1b. Verify that member belongs to this church
-    const { data: memberData } = await supabase
-      .schema('church')
-      .from('members')
+    const { data: memberData } = await scopedDb
+      .church('members')
       .select('id')
       .eq('id', memberId)
-      .eq('church_id', eventData.church_id)
       .maybeSingle();
 
     if (!memberData) throw new Error('Member does not belong to this church');
 
-    // 2. Direct delete from attendance_logs using Admin Client (bypasses RLS)
-    // We include church_id for extra safety in multi-tenant environment
-    const { error } = await supabase
-      .schema('church')
-      .from('attendance_logs')
+    // 2. Direct delete from attendance_logs using tenant-scoped client
+    const { error } = await scopedDb
+      .church('attendance_logs')
       .delete()
       .match({ 
         member_id: memberId, 
         event_id: eventId,
-        church_id: eventData.church_id 
       });
 
     if (error) {
@@ -592,7 +568,7 @@ export async function removeAttendance(churchSlug: string, eventId: string, memb
     }
 
     // 3. Update the attendance count using the RPC
-    await supabase.schema('church').rpc('decrement_event_attendance', { event_id: eventId });
+    await scopedDb.admin.schema('church').rpc('decrement_event_attendance', { event_id: eventId });
 
     revalidatePath(`/${churchSlug}/usher/dashboard`);
     revalidatePath(`/${churchSlug}/admin/attendance`);

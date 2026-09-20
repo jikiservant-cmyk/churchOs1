@@ -65,7 +65,13 @@ export async function POST(request: Request) {
       const { smsId, reference: smsRef, status: smsStatus, providerId } = payload;
       console.log(`[Najiki Webhook] SMS Delivery Update for ${smsRef || smsId}: ${smsStatus}`);
 
-      if (smsRef || smsId) {
+      // F-05: validate before use - these values arrive in the request body.
+      const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const KEY_RE = /^[A-Za-z0-9_.:-]{1,80}$/;
+      const safeId = typeof smsId === 'string' && UUID_RE.test(smsId) ? smsId : null;
+      const safeRef = typeof smsRef === 'string' && KEY_RE.test(smsRef) ? smsRef : null;
+
+      if (safeId || safeRef) {
         const updateObj = {
           status: smsStatus?.toUpperCase() === 'DELIVERED' ? 'DELIVERED' : smsStatus?.toUpperCase() === 'FAILED' ? 'FAILED' : smsStatus,
           message_provider_status: smsStatus,
@@ -73,11 +79,26 @@ export async function POST(request: Request) {
           updated_at: new Date().toISOString()
         };
 
-        await db
+        // Resolve the owning tenant from the row itself, then update with an
+        // explicit predicate on each candidate column - no string-built filters.
+        const orConditions = [
+          safeId ? `provider_message_id.eq.${safeId}` : null,
+          safeRef ? `idempotency_key.eq.${safeRef}` : null,
+        ].filter(Boolean).join(',');
+
+        const { data: owners } = await db
           .schema('church')
           .from('sms_logs')
-          .update(updateObj)
-          .or(`provider_message_id.eq.${smsId},idempotency_key.eq.${smsRef}`);
+          .select('tenant_id, provider_message_id, idempotency_key')
+          .or(orConditions)
+          .limit(1);
+
+        for (const owner of owners ?? []) {
+          let q = db.schema('church').from('sms_logs').update(updateObj)
+            .eq('tenant_id', owner.tenant_id); // tenant scope, always
+          q = safeId ? q.eq('provider_message_id', safeId) : q.eq('idempotency_key', safeRef!);
+          await q;
+        }
       }
 
       return NextResponse.json({ received: true, eventType: 'SMS_DELIVERY_UPDATE' });
@@ -167,14 +188,16 @@ export async function POST(request: Request) {
         return NextResponse.json({ received: true });
       }
     } else if (status === 'failed') {
-      // Mark as failed
+      // Mark as failed ONLY if currently pending (F-03)
       await db
         .from('wallet_transactions')
         .update({
           status: 'failed',
-          raw_provider_response: payload
+          raw_provider_response: payload,
+          updated_at: new Date().toISOString()
         })
-        .eq('id', tx.id);
+        .eq('id', tx.id)
+        .eq('status', 'pending');
 
       console.log('[Najiki Webhook] ❌ Payment failed:', failureReason, 'Reference:', reference);
       return NextResponse.json({ received: true });

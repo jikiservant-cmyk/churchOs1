@@ -1,6 +1,7 @@
 import { createClient } from '@/lib/supabase/server';
 import { NextResponse } from 'next/server';
 import { sendSingleSMS } from '@/lib/sms-actions';
+import { normalizeUgPhone } from '@/lib/utils';
 
 export async function POST(req: Request) {
   const encoder = new TextEncoder();
@@ -40,49 +41,52 @@ export async function POST(req: Request) {
           return;
         }
 
-        // MT-06 remediation: Query and verify all recipients server-side strictly scoped to this tenant
+        // F-02: Query and verify all recipients server-side strictly scoped to this tenant by ID
         const requestedIds = Array.isArray(recipientIds)
-          ? recipientIds
+          ? recipientIds.filter(Boolean)
           : Array.isArray(recipients) ? recipients.map((r: any) => r.id).filter(Boolean) : [];
+
+        if (requestedIds.length === 0) {
+          sendUpdate({ type: 'fatal', error: 'Recipients must be selected from this church (ids are required).' });
+          controller.close();
+          return;
+        }
 
         let verifiedRecipients: Array<{ id: string; full_name: string; phone_number: string }> = [];
 
-        if (requestedIds.length > 0) {
-          const [membersRes, convertsRes] = await Promise.all([
-            supabase
-              .schema('church')
-              .from('members')
-              .select('id, full_name, phone_number')
-              .eq('church_id', churchId)
-              .in('id', requestedIds),
-            supabase
-              .schema('church')
-              .from('new_converts')
-              .select('id, full_name, phone_number')
-              .eq('church_id', churchId)
-              .in('id', requestedIds)
-          ]);
+        const [membersRes, convertsRes] = await Promise.all([
+          supabase
+            .schema('church')
+            .from('members')
+            .select('id, full_name, phone_number')
+            .eq('church_id', churchId)
+            .in('id', requestedIds),
+          supabase
+            .schema('church')
+            .from('new_converts')
+            .select('id, full_name, phone_number')
+            .eq('church_id', churchId)
+            .in('id', requestedIds)
+        ]);
 
-          const memberRecipients = (membersRes.data || []).map(m => ({
-            id: m.id,
-            full_name: m.full_name,
-            phone_number: m.phone_number
-          }));
+        const memberRecipients = (membersRes.data || []).map(m => ({
+          id: m.id,
+          full_name: m.full_name,
+          phone_number: normalizeUgPhone(m.phone_number)
+        }));
 
-          const convertRecipients = (convertsRes.data || []).map(c => ({
-            id: c.id,
-            full_name: c.full_name,
-            phone_number: c.phone_number
-          }));
+        const convertRecipients = (convertsRes.data || []).map(c => ({
+          id: c.id,
+          full_name: c.full_name,
+          phone_number: normalizeUgPhone(c.phone_number)
+        }));
 
-          verifiedRecipients = [...memberRecipients, ...convertRecipients];
-        }
-
-        // Exclude empty or invalid phone numbers
-        verifiedRecipients = verifiedRecipients.filter(r => r.phone_number && r.phone_number.trim().length > 5);
+        verifiedRecipients = [...memberRecipients, ...convertRecipients].filter(
+          (r): r is { id: string; full_name: string; phone_number: string } => !!r.phone_number
+        );
 
         if (verifiedRecipients.length === 0) {
-          sendUpdate({ type: 'fatal', error: 'No authorized recipients found for this church.' });
+          sendUpdate({ type: 'fatal', error: 'No authorized recipients with valid phone numbers found for this church.' });
           controller.close();
           return;
         }
@@ -111,11 +115,12 @@ export async function POST(req: Request) {
         const isSandbox = process.env.AT_USERNAME?.toLowerCase() === 'sandbox';
         const senderId = (!isSandbox && church?.sender_id) ? church.sender_id.trim() : '';
 
-        // Initial progress
-        sendUpdate({ type: 'start', total: recipients.length });
+        // F-02: the send loop, the progress total and the idempotency key are all
+        // driven by rows that were re-read from the database for THIS tenant.
+        sendUpdate({ type: 'start', total: verifiedRecipients.length });
 
-        for (let i = 0; i < recipients.length; i++) {
-          const recipient = recipients[i];
+        for (let i = 0; i < verifiedRecipients.length; i++) {
+          const recipient = verifiedRecipients[i];
           
           try {
             // Check balance before each send to be safe
@@ -133,7 +138,7 @@ export async function POST(req: Request) {
               phoneNumber: recipient.phone_number,
               message: personalizedMessage,
               churchId,
-              idempotencyKey: `broadcast_${churchId.slice(0, 8)}_${recipient.id}_${Date.now()}_${i}`,
+              idempotencyKey: `broadcast_${churchId.slice(0, 8)}_${recipient.id}_${i}`,
               senderId,
               balance
             });

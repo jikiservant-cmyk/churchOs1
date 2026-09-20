@@ -33,9 +33,17 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Forbidden: Access denied for this tenant' }, { status: 403 });
     }
 
-    // Cost calculation on backend to ensure security
-    const SMS_PRICE = 15;
-    const amountToCharge = smsAmount * SMS_PRICE;
+    // F-06: the wallet's sms_rate (default 70, see public.wallets) is the single
+    // source of truth for price. Deriving a "price" here that the wallet does not
+    // use created a 15 vs 70 UGX divergence on the same product.
+    const { data: wallet } = await supabase
+      .from('wallets')
+      .select('sms_rate')
+      .eq('tenant_id', adminProfile.tenant_id)
+      .maybeSingle();
+
+    const smsRate = wallet?.sms_rate ?? 70;
+    const amountToCharge = smsAmount * smsRate;
 
     // Generate a high-entropy unique reference for the transaction
     const reference = `TX-${crypto.randomUUID()}`;

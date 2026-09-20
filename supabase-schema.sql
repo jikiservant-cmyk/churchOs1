@@ -180,6 +180,9 @@ BEGIN
     RAISE EXCEPTION 'User ID is required';
   END IF;
 
+  -- Advisory transaction lock per user ID to serialize concurrent provisioning requests (F-09)
+  PERFORM pg_advisory_xact_lock(hashtextextended(p_user_id::text, 0));
+
   -- Ensure caller is authenticated and matches p_user_id unless called via service_role bypass
   IF auth.uid() IS NOT NULL AND p_user_id IS DISTINCT FROM auth.uid() THEN
     RAISE EXCEPTION 'Unauthorized: cannot provision workspace for another user';
@@ -251,7 +254,8 @@ BEGIN
     id,
     name,
     slug,
-    passkey,
+    passkey_hash,
+    passkey_version,
     app_type,
     ip_address
   )
@@ -259,7 +263,8 @@ BEGIN
     v_tenant_uuid,
     p_name,
     v_canonical_slug,
-    lpad(floor(random() * 900000 + 100000)::text, 6, '0'),
+    encode(digest(concat(v_canonical_slug, ':', gen_random_uuid()::text), 'sha256'), 'hex'),
+    1,
     'church',
     p_ip
   );
@@ -568,6 +573,10 @@ BEGIN
     RAISE EXCEPTION 'Wallet not found for tenant';
   END IF;
 
+  IF auth.uid() IS NOT NULL AND p_tenant_id IS DISTINCT FROM church.my_tenant_id() THEN
+    RAISE EXCEPTION 'Unauthorized: cross-tenant wallet access denied';
+  END IF;
+
   IF p_tx_type = 'credit' OR p_tx_type = 'topup' THEN
     UPDATE public.wallets
     SET balance = balance + p_amount,
@@ -580,9 +589,9 @@ BEGIN
     WHERE id = v_wallet_id AND balance >= p_amount;
   END IF;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, church;
 
-REVOKE EXECUTE ON FUNCTION public.apply_wallet_transaction(uuid, bigint, text, text) FROM PUBLIC, anon;
+REVOKE EXECUTE ON FUNCTION public.apply_wallet_transaction(uuid, bigint, text, text) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.apply_wallet_transaction(uuid, bigint, text, text) TO service_role;
 
 -- RPC: Cascade delete church tenant (Service Role Only)
@@ -1119,10 +1128,21 @@ BEGIN
 END;
 $$;
 
--- RPC Functions for Attendance Counts
+-- RPC Functions for Attendance Counts (Service Role / Tenant-Guarded Only)
 CREATE OR REPLACE FUNCTION church.increment_event_attendance(event_id uuid)
 RETURNS void AS $$
+DECLARE
+  v_church_id uuid;
 BEGIN
+  SELECT church_id INTO v_church_id FROM church.events WHERE id = event_id;
+  IF v_church_id IS NULL THEN
+    RAISE EXCEPTION 'Event not found';
+  END IF;
+
+  IF auth.uid() IS NOT NULL AND v_church_id IS DISTINCT FROM church.my_tenant_id() THEN
+    RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
+  END IF;
+
   UPDATE church.events
   SET attending_count = attending_count + 1
   WHERE id = event_id;
@@ -1131,7 +1151,18 @@ $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = church, public;
 
 CREATE OR REPLACE FUNCTION church.decrement_event_attendance(event_id uuid)
 RETURNS void AS $$
+DECLARE
+  v_church_id uuid;
 BEGIN
+  SELECT church_id INTO v_church_id FROM church.events WHERE id = event_id;
+  IF v_church_id IS NULL THEN
+    RAISE EXCEPTION 'Event not found';
+  END IF;
+
+  IF auth.uid() IS NOT NULL AND v_church_id IS DISTINCT FROM church.my_tenant_id() THEN
+    RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
+  END IF;
+
   UPDATE church.events
   SET attending_count = attending_count - 1
   WHERE id = event_id AND attending_count > 0;
@@ -1289,10 +1320,10 @@ REVOKE EXECUTE ON FUNCTION church.check_in_member_manual(uuid, uuid, church.atte
 GRANT EXECUTE ON FUNCTION church.check_in_member_manual(uuid, uuid, church.attendance_status, timestamptz, text, uuid) TO authenticated, service_role;
 REVOKE EXECUTE ON FUNCTION church.check_in_member_manual_by_date(uuid, church.event_service_type, date, uuid, church.attendance_status, timestamptz, text) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION church.check_in_member_manual_by_date(uuid, church.event_service_type, date, uuid, church.attendance_status, timestamptz, text) TO authenticated, service_role;
-REVOKE EXECUTE ON FUNCTION church.increment_event_attendance(uuid) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION church.increment_event_attendance(uuid) TO authenticated, service_role;
-REVOKE EXECUTE ON FUNCTION church.decrement_event_attendance(uuid) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION church.decrement_event_attendance(uuid) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION church.increment_event_attendance(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.increment_event_attendance(uuid) TO service_role;
+REVOKE EXECUTE ON FUNCTION church.decrement_event_attendance(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION church.decrement_event_attendance(uuid) TO service_role;
 REVOKE EXECUTE ON FUNCTION church.remove_attendance_manual(uuid, uuid) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION church.remove_attendance_manual(uuid, uuid) TO authenticated, service_role;
 
@@ -1434,7 +1465,8 @@ CREATE TABLE IF NOT EXISTS church.broadcasts (
   created_at timestamptz DEFAULT now(),
   started_at timestamptz,
   updated_at timestamptz DEFAULT now(),
-  completed_at timestamptz
+  completed_at timestamptz,
+  CONSTRAINT broadcasts_tenant_id_unique UNIQUE (id, tenant_id)
 );
 
 DO $$
@@ -1458,7 +1490,7 @@ CREATE POLICY "broadcasts_service_role" ON church.broadcasts FOR ALL TO service_
 CREATE TABLE IF NOT EXISTS church.sms_queue (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
-  broadcast_id uuid REFERENCES church.broadcasts(id) ON DELETE CASCADE,
+  broadcast_id uuid,
   recipient_id text,
   recipient_phone text NOT NULL,
   message text NOT NULL,
@@ -1471,7 +1503,8 @@ CREATE TABLE IF NOT EXISTS church.sms_queue (
   scheduled_at timestamptz DEFAULT now(),
   processed_at timestamptz,
   created_at timestamptz DEFAULT now(),
-  updated_at timestamptz DEFAULT now()
+  updated_at timestamptz DEFAULT now(),
+  CONSTRAINT sms_queue_broadcast_tenant_fkey FOREIGN KEY (broadcast_id, tenant_id) REFERENCES church.broadcasts(id, tenant_id) ON DELETE CASCADE
 );
 
 ALTER TABLE church.sms_queue ENABLE ROW LEVEL SECURITY;
@@ -1545,13 +1578,22 @@ BEGIN
   END IF;
 
   IF v_current_status = 'success' THEN
-    RETURN jsonb_build_object('result', 'duplicate');
+    RETURN jsonb_build_object('result', 'duplicate', 'previous_status', 'success');
+  END IF;
+
+  IF v_current_status <> 'pending' THEN
+    RETURN jsonb_build_object('result', 'duplicate', 'previous_status', v_current_status);
   END IF;
 
   UPDATE public.wallet_transactions
   SET status = 'success',
-      raw_provider_response = p_payload
-  WHERE id = v_tx_id;
+      raw_provider_response = p_payload,
+      updated_at = now()
+  WHERE id = v_tx_id AND status = 'pending';
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('result', 'duplicate');
+  END IF;
 
   UPDATE public.wallets
   SET balance = balance + p_amount,
