@@ -2,6 +2,10 @@ import { normalizeUgPhone } from '@/lib/utils';
 // @ts-ignore
 import Africastalking from 'africastalking';
 import { createAdminClient } from '@/lib/supabase/server';
+import {
+  sendNajikiSms,
+  shouldFallBackToAfricasTalking,
+} from '@/lib/najiki/client';
 
 interface SendSMSParams {
   supabase: any;
@@ -14,44 +18,6 @@ interface SendSMSParams {
     balance: number;
     sms_rate: number;
   };
-}
-
-// Najiki SMS Sending Function
-async function sendNajikiSMS({
-  phoneNumber,
-  message,
-}: {
-  phoneNumber: string;
-  message: string;
-}) {
-  const najikiApiUrl = process.env.NAJIKI_API_URL;
-  const najikiApiKey = process.env.NAJIKI_API_KEY;
-  const najikiAppCode = process.env.NAJIKI_APPLICATION_CODE;
-
-  if (!najikiApiUrl || !najikiApiKey || !najikiAppCode) {
-    throw new Error('Najiki configuration missing from environment variables');
-  }
-
-  const response = await fetch(`${najikiApiUrl}/api/messaging/send`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${najikiApiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      to: phoneNumber,
-      message,
-      applicationCode: najikiAppCode,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Najiki API error: ${response.status} - ${errorText}`);
-  }
-
-  const result = await response.json();
-  return result; // Should have { smsId, reference, status: "queued" }
 }
 
 export async function sendSingleSMS({
@@ -95,9 +61,26 @@ export async function sendSingleSMS({
     let najikiResult;
     let providerUsed = 'najiki';
     try {
-      najikiResult = await sendNajikiSMS({ phoneNumber: finalPhone, message });
+      najikiResult = await sendNajikiSms({
+        to: finalPhone,
+        message,
+        from: senderId,
+        // Na'jiki dedupes on (application, idempotencyKey) — forwarding our own
+        // key makes a retried request a no-op on their side instead of a second
+        // SMS and a second charge.
+        idempotencyKey: actualIdempotencyKey,
+      });
     } catch (najikiError) {
-      console.warn('[SMS Actions] Najiki failed, falling back to Africa\'s Talking:', najikiError);
+      if (!shouldFallBackToAfricasTalking(najikiError)) {
+        // Na'jiki rejected the request outright — do not silently re-send it
+        // through another provider. Log it and let the caller see the reason.
+        console.error(
+          '[SMS Actions] Najiki rejected the SMS request; not falling back:',
+          najikiError instanceof Error ? najikiError.message : najikiError
+        );
+        throw najikiError;
+      }
+      console.warn('[SMS Actions] Najiki unavailable, falling back to the direct Africa route:', najikiError);
       providerUsed = 'africastalking';
     }
 
@@ -107,12 +90,27 @@ export async function sendSingleSMS({
     let providerStatus = null;
 
     if (providerUsed === 'najiki' && najikiResult) {
-      // Handle Najiki response
+      // Handle Najiki response: 202 { success, message, smsId, reference,
+      // status, deduplicated, createdAt }.
+      if (najikiResult.success === false) {
+        throw new Error(
+          `Najiki refused the SMS: ${najikiResult.message || najikiResult.status || 'unknown error'}`
+        );
+      }
+
       isSuccess = true;
       finalStatus = 'Queued';
       providerMessageId = najikiResult.smsId;
       providerStatus = najikiResult.status;
 
+      // Na'jiki returned an already-queued message for this idempotency key:
+      // the original request was accepted (and billed) already, so charging the
+      // wallet again would double-bill the church for one SMS.
+      if (najikiResult.deduplicated === true) {
+        console.log(
+          `[SMS Actions] Najiki deduplicated SMS ${najikiResult.smsId} for key ${actualIdempotencyKey} — wallet not debited again`
+        );
+      } else {
       // 2. Perform Atomic Deduction via RPC (eliminates read-modify-write race)
       const adminSupabase = await createAdminClient();
       
@@ -149,6 +147,7 @@ export async function sendSingleSMS({
       if (ledgerErr) {
         console.error('[SMS Actions] Ledger write failed after debit:', ledgerErr);
         throw new Error(`Ledger write failed after debit: ${ledgerErr.message}`);
+      }
       }
     } else {
       // Fallback to Africa's Talking
