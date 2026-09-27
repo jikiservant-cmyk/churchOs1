@@ -51,6 +51,19 @@ function getServiceDb() {
 const TERMINAL_FAILURE_STATUSES = ['failed', 'expired', 'cancelled'];
 
 export async function POST(request: Request) {
+  try {
+    return await handlePost(request)
+  } catch (err: any) {
+    // A 500 tells Na'jiki to retry, which is what we want for a transient
+    // failure — and every handler below is idempotent (the wallet credit is
+    // guarded by billing_events, the receipt SMS by its own key). It must never
+    // be an unhandled rejection.
+    console.error('[Najiki Webhook] Unhandled error:', err?.message ?? err)
+    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 })
+  }
+}
+
+async function handlePost(request: Request) {
   // 1. Read the raw body first — the HMAC covers the exact bytes received.
   const rawBody = await request.text();
 
