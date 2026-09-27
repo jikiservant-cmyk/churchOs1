@@ -4,8 +4,18 @@ import { createClient, createAdminClient } from '@/lib/supabase/server';
 import { revalidatePath } from 'next/cache';
 import { normalizeUgPhone } from './utils';
 import crypto from 'crypto';
+import {
+  buildChurchDonationPayment,
+  buildChurchTopupPayment,
+  createNajikiPayment,
+  getNajikiConfig,
+  isNajikiConfigured,
+} from '@/lib/najiki/client';
 
 // Helper to format phone for Najiki (E.164 without plus or 256...)
+// Na'jiki's LivePay adapter runs its own normalizePhone() (which strips the
+// leading '+') before calling the provider, so the digits-only E.164 form is
+// the canonical thing to send: 2567XXXXXXXX.
 function formatPhoneForNajiki(phone: string): string {
   const normalized = normalizeUgPhone(phone);
   if (normalized) {
@@ -55,12 +65,12 @@ export async function initiateNajikiPayment(formData: FormData) {
       return { error: 'Access denied: cannot initiate payment for another church' };
     }
 
-    const apiKey = process.env.NAJIKI_API_KEY;
-    const applicationCode = process.env.NAJIKI_APPLICATION_CODE;
-
-    if (!apiKey) {
-      console.error('[Najiki] API credentials missing from environment.');
-      return { error: 'Payment service not configured' };
+    // Fail fast with the exact variable names that are missing.
+    try {
+      getNajikiConfig();
+    } catch (configError: any) {
+      console.error('[Najiki] Payment credentials missing from environment.');
+      return { error: configError?.message ?? 'Payment service not configured' };
     }
 
     // 0. Create admin client
@@ -142,72 +152,64 @@ export async function initiateNajikiPayment(formData: FormData) {
     // 3. Format phone number to E.164 or standard international format
     const formattedPhone = formatPhoneForNajiki(phoneNumber);
 
-    // 4. Call Najiki API
-    const requestBody = {
-      applicationCode: applicationCode || 'church',
-      tenantCode: tenantCode,
-      paymentTypeCode: 'topup',
-      externalEntityId: churchId,
-      amount: amount,
-      currency: 'UGX',
+    // 4. Call Najiki API — POST /api/payments
+    //
+    // Na'jiki generates its own `reference` and returns it as `reference` (not
+    // `paymentIntentId`), so our own reference has to travel inside `metadata`
+    // for the settlement webhook to find this row again. See
+    // lib/najiki/webhook.ts → transactionLookupCandidates().
+    const paymentRequest = buildChurchTopupPayment({
+      churchId,
+      tenantCode,
+      churchSlug: churchData?.slug,
+      reference,
+      idempotencyKey,
+      amount,
       phoneNumber: formattedPhone,
-      idempotencyKey: idempotencyKey,
-      metadata: {
-        churchId,
-        tenantCode,
-        product: 'sms_topup',
-        source: 'admin-dashboard'
-      }
-    };
-
-    console.log('[Najiki] Sending request to /api/payments:', JSON.stringify({ ...requestBody, phoneNumber: 'REDACTED' }));
-
-    const response = await fetch('https://najiki.netlify.app/api/payments', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'X-API-Key': apiKey,
-      },
-      body: JSON.stringify(requestBody),
     });
 
+    console.log('[Najiki] Sending request to /api/payments:', JSON.stringify({ ...paymentRequest, phoneNumber: 'REDACTED' }));
+
     let result;
-    const responseText = await response.text();
     try {
-      result = JSON.parse(responseText);
-    } catch (e) {
-      console.error('[Najiki] Failed to parse JSON response. Raw response:', responseText);
-      result = { message: 'Invalid response from payment provider' };
+      result = await createNajikiPayment(paymentRequest);
+    } catch (err: any) {
+      // Surface Na'jiki's own error text — a rejected payload must never look
+      // like a success to the caller.
+      console.error('[Najiki] API Error Response:', err?.message ?? err);
+      await supabaseAdmin
+        .from('wallet_transactions')
+        .update({
+          status: 'failed',
+          raw_provider_response: { error: err?.message ?? String(err), status: err?.status ?? null }
+        })
+        .eq('reference_code', reference);
+
+      return { error: err?.message || 'Payment request failed' };
     }
 
     console.log('[Najiki] API Response:', JSON.stringify(result));
 
-    if (!response.ok) {
-      console.error('[Najiki] API Error Response:', result);
-      // Mark as failed in DB
+    // 5. Update transaction with Najiki response.
+    // `reference` is Na'jiki's own payment reference; `reference_code` stays ours.
+    if (result.paymentId) {
       await supabaseAdmin
         .from('wallet_transactions')
         .update({ 
-          status: 'failed', 
-          raw_provider_response: result 
+          raw_provider_response: result,
+          reference: result.reference ?? null
         })
-        .eq('reference', reference);
-
-      return { error: result.error || result.message || 'Payment request failed' };
+        .eq('reference_code', reference);
     }
 
-    // 5. Update transaction with Najiki response
-    if (result.paymentIntentId) {
-      await supabaseAdmin
-        .from('wallet_transactions')
-        .update({ 
-          raw_provider_response: result 
-        })
-        .eq('reference', reference);
-    }
-
-    return { success: true, message: 'Payment prompt sent to your phone!', paymentIntentId: result.paymentIntentId, reference: reference };
+    return {
+      success: true,
+      message: 'Payment prompt sent to your phone!',
+      paymentId: result.paymentId,
+      najikiReference: result.reference,
+      status: result.status,
+      reference: reference
+    };
   } catch (err: any) {
     console.error('[Najiki] Unexpected error during initiation:', err);
     return { error: 'An unexpected error occurred: ' + (err.message || 'Unknown error') };
@@ -324,41 +326,48 @@ export async function initiateDonationPayment(params: {
       return { success: true, message: 'Payment prompt sent to your phone!', reference };
     }
 
-    // Fallback: Najiki payment provider if configured
-    const najikiKey = process.env.NAJIKI_API_KEY;
-    if (najikiKey) {
+    // Fallback: Najiki payment provider if configured.
+    //
+    // This used to authenticate with `x-api-key: <key>`. Na'jiki's
+    // POST /api/payments reads ONLY `Authorization: Bearer <api key>` and
+    // answers 401 "Missing or invalid authorization header" for anything else,
+    // so every donation routed through this branch was rejected before it
+    // reached the provider.
+    if (isNajikiConfigured()) {
       const formattedPhone = formatPhoneForNajiki(cleanPhone);
-      const response = await fetch(`${process.env.NAJIKI_API_URL || 'https://najiki.netlify.app'}/api/payments`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': najikiKey,
-        },
-        body: JSON.stringify({
-          applicationCode: process.env.NAJIKI_APPLICATION_CODE || 'church',
-          tenantCode: church.slug,
-          paymentTypeCode: 'donation',
-          externalEntityId: churchId,
-          amount: amount,
-          currency: 'UGX',
-          phoneNumber: formattedPhone,
-          idempotencyKey: idempotencyKey,
-          metadata: {
-            churchId,
-            category: category || 'general',
-            product: 'donation',
-            source: 'public_giving'
-          }
-        }),
+      const paymentRequest = buildChurchDonationPayment({
+        churchId,
+        // Na'jiki resolves the tenant as (applicationId, code); the church slug
+        // is what the tenant row is keyed on.
+        tenantCode: church.slug,
+        churchName: church.name,
+        reference,
+        idempotencyKey,
+        amount,
+        phoneNumber: formattedPhone,
+        category,
       });
 
-      const result = await response.json();
-      if (!response.ok) {
+      let result;
+      try {
+        result = await createNajikiPayment(paymentRequest);
+      } catch (err: any) {
+        console.error('[Donation] Najiki rejected the payment:', err?.message ?? err);
         await supabaseAdmin
           .from('wallet_transactions')
-          .update({ status: 'failed', raw_provider_response: result })
+          .update({
+            status: 'failed',
+            raw_provider_response: { error: err?.message ?? String(err), status: err?.status ?? null }
+          })
           .eq('reference_code', reference);
-        return { error: result.error || result.message || 'Payment request failed' };
+        return { error: err?.message || 'Payment request failed' };
+      }
+
+      if (result.paymentId) {
+        await supabaseAdmin
+          .from('wallet_transactions')
+          .update({ raw_provider_response: result, reference: result.reference ?? null })
+          .eq('reference_code', reference);
       }
 
       return { success: true, message: 'Payment prompt sent to your phone!', reference };
