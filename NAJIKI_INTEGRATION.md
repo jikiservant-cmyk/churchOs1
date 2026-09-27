@@ -330,3 +330,24 @@ against a mock that enforces Na'jiki's **own** Zod schema
 Live end-to-end against the deployed gateway was **not** possible from this
 sandbox (see ambiguity 7) — the acceptance evidence above comes from Na'jiki's
 own validator running on the exact bytes churchOs sends.
+
+### Live smoke test of the webhook route
+
+`next dev` was started with a webhook secret and no Supabase (so the route's
+pre-database paths could be exercised), and real requests were posted to
+`/api/najiki/webhook`, signed with Na'jiki's own `buildNotificationHeaders()`:
+
+| Request | Result |
+| --- | --- |
+| signed, unrecognised shape | `200 {"received":true,"ignored":true}` |
+| signed, payment notification with no `paymentIntentId` | `200 {"received":true}` |
+| signed, full payment notification | `500` — reached the DB stage and failed on `supabaseUrl is required` (no Supabase in this sandbox), returned as a retryable 500 by the new guard |
+| signed, SMS delivery update | `500` — same DB-stage failure |
+| unsigned | `403 Missing x-najiki-timestamp / x-najiki-signature headers` |
+| timestamp 6 minutes old | `403 Timestamp outside the 5-minute replay window` |
+| signed body A, sent body B | `403 Signature mismatch` |
+| legacy `x-najiki-signature` only | `403 Missing … headers` |
+
+So signature verification, replay protection and the fail-closed guard are
+confirmed working in the real Next.js runtime. What could not be exercised
+without a database is the ledger write and the receipt SMS.
