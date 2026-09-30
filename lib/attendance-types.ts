@@ -22,7 +22,10 @@ export interface AttendanceLog {
 
 export type AttendanceStatus = 'present' | 'late' | 'absent' | 'excused';
 
-export type AttendanceFlagType = 'missed_3_sundays' | 'inactive_30_days';
+// 'missed_consecutive_events' is the current engine (schedule-agnostic, works
+// for any meeting rhythm). 'missed_3_sundays' and 'inactive_30_days' are legacy
+// types kept so older flag rows still render; see ATTENDANCE_FLAGS.md.
+export type AttendanceFlagType = 'missed_3_sundays' | 'inactive_30_days' | 'missed_consecutive_events';
 export type AttendanceFlagStatus = 'open' | 'followed_up' | 'resolved';
 
 export interface AttendanceFlag {

@@ -59,7 +59,11 @@ export function AttendanceAlerts({ flags, churchSlug }: AttendanceAlertsProps) {
           <div className="flex justify-between items-start mb-3">
             <div className="flex flex-col gap-1">
               <span className="px-2 py-0.5 bg-[#FFF4E5] text-[#B5622A] text-[9px] font-bold uppercase tracking-widest rounded-full w-fit">
-                {flag.flag_type === 'inactive_30_days' ? 'Inactive (30 Days)' : 'Missed 3 Sundays'}
+                {flag.flag_type === 'missed_consecutive_events'
+                  ? 'Missed Consecutive Events'
+                  : flag.flag_type === 'inactive_30_days'
+                    ? 'Inactive (30 Days)'
+                    : 'Missed 3 Sundays'}
               </span>
             </div>
             <span className="text-[10px] text-[#9A7E65] font-medium flex items-center gap-1">

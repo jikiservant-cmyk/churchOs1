@@ -101,11 +101,11 @@ export async function login(prevState: AuthState, formData: FormData): Promise<A
       }
     }
 
-    redirect(`/${targetSlug}/admin`);
+    return { success: true, redirectTo: `/${targetSlug}/admin` };
   } catch (err: any) {
-    if (err.message === 'NEXT_REDIRECT' || err.__next_redirect) throw err;
+    if (err?.message === 'NEXT_REDIRECT' || err?.__next_redirect || err?.digest?.startsWith?.('NEXT_REDIRECT')) throw err;
     console.error('[Auth] Login exception:', err);
-    return { error: err.message || 'An unexpected error occurred during login.' };
+    return { error: err?.message || 'An unexpected error occurred during login.' };
   }
 }
 
@@ -145,7 +145,7 @@ export async function signup(prevState: AuthState, formData: FormData): Promise<
     console.log('[Auth] Signup success for:', email);
     return { success: true, redirectTo: '/signup/provision' };
   } catch (err: any) {
-    if (err.message === 'NEXT_REDIRECT' || err.__next_redirect) throw err;
+    if (err?.message === 'NEXT_REDIRECT' || err?.__next_redirect || err?.digest?.startsWith?.('NEXT_REDIRECT')) throw err;
     console.error('[Auth] Critical signup exception:', err);
     return { error: 'An unexpected error occurred. Please try again later.' };
   }

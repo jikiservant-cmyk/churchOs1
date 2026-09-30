@@ -42,8 +42,12 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'attendance_flag_type') THEN
     CREATE TYPE church.attendance_flag_type AS ENUM (
       'missed_3_sundays',
-      'inactive_30_days'
+      'inactive_30_days',
+      'missed_consecutive_events'
     );
+  ELSE
+    -- Existing databases: pick up the event-streak flag type (migration 005).
+    ALTER TYPE church.attendance_flag_type ADD VALUE IF NOT EXISTS 'missed_consecutive_events';
   END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'attendance_flag_status') THEN
@@ -76,8 +80,25 @@ CREATE TABLE IF NOT EXISTS church.churches (
   logo_url text,
   sender_id text,
   ip_address text,
+  attendance_flag_threshold integer NOT NULL DEFAULT 3,
+  meeting_days smallint[] DEFAULT NULL,
   created_at timestamptz DEFAULT now()
 );
+
+-- Idempotent for databases created before these columns existed (migrations 005/006)
+ALTER TABLE church.churches
+  ADD COLUMN IF NOT EXISTS attendance_flag_threshold integer NOT NULL DEFAULT 3;
+ALTER TABLE church.churches
+  ADD COLUMN IF NOT EXISTS meeting_days smallint[] DEFAULT NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'churches_meeting_days_valid') THEN
+    ALTER TABLE church.churches
+      ADD CONSTRAINT churches_meeting_days_valid
+      CHECK (meeting_days IS NULL OR (array_length(meeting_days, 1) BETWEEN 1 AND 7 AND meeting_days <@ '{1,2,3,4,5,6,7}'::smallint[]));
+  END IF;
+END $$;
 
 -- 4. Create the admin_profiles table in public (references public.tenants)
 CREATE TABLE IF NOT EXISTS public.admin_profiles (
@@ -617,18 +638,31 @@ CREATE TABLE IF NOT EXISTS church.members (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   full_name text NOT NULL,
-  code text UNIQUE,
+  code text,
   phone_number text,
   email text,
   gender text,
   birthday date,
   is_youth boolean DEFAULT false,
   status text DEFAULT 'active',
+  expected_days smallint[] DEFAULT NULL,
   created_at timestamptz DEFAULT now(),
   updated_at timestamptz DEFAULT now(),
 
   CONSTRAINT members_id_church_uniq UNIQUE (id, church_id)
 );
+
+ALTER TABLE church.members
+  ADD COLUMN IF NOT EXISTS expected_days smallint[] DEFAULT NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'members_expected_days_valid') THEN
+    ALTER TABLE church.members
+      ADD CONSTRAINT members_expected_days_valid
+      CHECK (expected_days IS NULL OR (array_length(expected_days, 1) BETWEEN 1 AND 7 AND expected_days <@ '{1,2,3,4,5,6,7}'::smallint[]));
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_members_church_id ON church.members(church_id);
 CREATE INDEX IF NOT EXISTS idx_members_phone_number ON church.members(phone_number);
@@ -637,7 +671,7 @@ CREATE TABLE IF NOT EXISTS church.new_converts (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   name text NOT NULL,
-  code text UNIQUE,
+  code text,
   contact text,
   follow_up_status text DEFAULT 'pending',
   notes text,
@@ -651,7 +685,7 @@ CREATE TABLE IF NOT EXISTS church.events (
   church_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
 
   name text NOT NULL,
-  code text UNIQUE,
+  code text,
   service_type church.event_service_type NOT NULL,
   event_date date NOT NULL DEFAULT CURRENT_DATE,
   start_time time DEFAULT '09:00:00',
@@ -705,7 +739,7 @@ CREATE TABLE IF NOT EXISTS church.prayers (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   submitter_name text NOT NULL,
-  code text UNIQUE,
+  code text,
   body text NOT NULL,
   status text DEFAULT 'open',
   created_at timestamptz DEFAULT now()
@@ -715,7 +749,7 @@ CREATE TABLE IF NOT EXISTS church.small_groups (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   name text NOT NULL,
-  code text UNIQUE,
+  code text,
   leader_name text NOT NULL,
   meeting_day text NOT NULL,
   member_count int DEFAULT 0,
@@ -729,6 +763,23 @@ CREATE TABLE IF NOT EXISTS church.donations (
   amount_cents bigint NOT NULL,
   created_at timestamptz DEFAULT now()
 );
+
+-- Tenant-scoped code uniqueness (migration 007): codes are per-church,
+-- not globally unique; NULL codes are excluded via partial index.
+CREATE UNIQUE INDEX IF NOT EXISTS members_church_code_uniq
+  ON church.members (church_id, code) WHERE code IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS new_converts_church_code_uniq
+  ON church.new_converts (church_id, code) WHERE code IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS events_church_code_uniq
+  ON church.events (church_id, code) WHERE code IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS prayers_church_code_uniq
+  ON church.prayers (church_id, code) WHERE code IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS small_groups_church_code_uniq
+  ON church.small_groups (church_id, code) WHERE code IS NOT NULL;
 
 -- Initial demo data for Grace Church (MT-01: rotated static passkey to dynamic 6-digit CSPRNG)
 INSERT INTO church.churches (id, name, slug, passkey, theme_color, logo_url)
@@ -1415,14 +1466,233 @@ $$;
 REVOKE EXECUTE ON FUNCTION church.process_inactive_30_days_followups(uuid) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION church.process_inactive_30_days_followups(uuid) TO service_role;
 
+-- Consecutive-event absence flags (schedule-agnostic, expectation-aware).
+-- See migrations/005 + 006 and lib/attendance-streaks.ts for the tested spec.
+DROP FUNCTION IF EXISTS church.refresh_consecutive_event_flags(uuid);
+
+CREATE OR REPLACE FUNCTION church.refresh_consecutive_event_flags(
+  p_church_id  uuid,
+  p_member_ids uuid[] DEFAULT NULL   -- NULL = all active members (nightly/manual).
+                                     -- Set = only these members (event-completion path).
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = church, public, auth
+AS $func$
+DECLARE
+  v_now          timestamptz := now();
+  v_threshold    integer;
+  v_meeting_days smallint[];
+  v_inserted     integer := 0;
+  v_reopened     integer := 0;
+BEGIN
+  IF p_church_id IS NULL THEN
+    RAISE EXCEPTION 'Church ID is required';
+  END IF;
+
+  -- Tenant guard (nested IFs: never evaluate my_tenant_id() when there is no
+  -- caller context — service role / pg_cron pass through).
+  IF auth.uid() IS NOT NULL THEN
+    IF p_church_id IS DISTINCT FROM church.my_tenant_id() THEN
+      RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
+    END IF;
+  END IF;
+
+  -- Scope filter must be non-empty when given, or every statement below would
+  -- silently no-op on an empty array. Treat 'all' as the default instead.
+  IF p_member_ids IS NOT NULL AND array_length(p_member_ids, 1) IS NULL THEN
+    p_member_ids := NULL;
+  END IF;
+
+  SELECT LEAST(GREATEST(COALESCE(c.attendance_flag_threshold, 3), 1), 52),
+         c.meeting_days
+    INTO v_threshold, v_meeting_days
+    FROM church.churches c
+   WHERE c.id = p_church_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Church % not found', p_church_id;
+  END IF;
+
+  ---------------------------------------------------------------------------
+  -- Streak computation.
+  -- For every (scoped) active member, walk the church's completed events
+  -- newest -> oldest and count the run of misses starting at the most recent
+  -- event the member was EXPECTED at:
+  --   * event weekday must be in the tenant meeting_days (when configured)
+  --   * event weekday must be in the member's expected_days (when set)
+  --   * event must be on/after the member joined
+  -- A missing log counts as a miss; 'present'/'late'/'excused' break the run.
+  ---------------------------------------------------------------------------
+  DROP TABLE IF EXISTS tmp_cef_streaks;
+
+  CREATE TEMP TABLE tmp_cef_streaks ON COMMIT DROP AS
+  WITH ranked AS (
+    SELECT
+      m.id AS member_id,
+      al.attendance_status,
+      ROW_NUMBER() OVER (
+        PARTITION BY m.id
+        ORDER BY e.event_date DESC, e.start_time DESC, e.id DESC
+      ) AS rn
+    FROM church.members m
+    JOIN church.events e
+      ON e.church_id = m.church_id
+     AND e.status = 'completed'
+     AND e.event_date >= (m.created_at AT TIME ZONE 'utc')::date
+     AND (v_meeting_days IS NULL
+          OR extract(isodow FROM e.event_date)::smallint = ANY(v_meeting_days))
+     AND (m.expected_days IS NULL
+          OR extract(isodow FROM e.event_date)::smallint = ANY(m.expected_days))
+    LEFT JOIN church.attendance_logs al
+      ON al.event_id = e.id
+     AND al.member_id = m.id
+    WHERE m.church_id = p_church_id
+      AND m.status = 'active'
+      AND (p_member_ids IS NULL OR m.id = ANY(p_member_ids))
+  ),
+  marked AS (
+    SELECT
+      member_id,
+      rn,
+      MIN(CASE WHEN attendance_status IN ('present', 'late', 'excused') THEN rn END)
+        OVER (PARTITION BY member_id) AS first_non_miss_rn
+    FROM ranked
+  )
+  SELECT member_id, COUNT(*)::integer AS consecutive_misses
+  FROM marked
+  WHERE rn < COALESCE(first_non_miss_rn, 2147483647)
+  GROUP BY member_id;
+
+  -- Lifecycle 1: resolve open/followed_up flags whose streak fell below the
+  -- threshold (returned, excused, no longer expected at upcoming events, or
+  -- became inactive).
+  UPDATE church.attendance_flags f
+     SET status = 'resolved'::church.attendance_flag_status
+   WHERE f.church_id = p_church_id
+     AND f.flag_type = 'missed_consecutive_events'::church.attendance_flag_type
+     AND f.status IN ('open'::church.attendance_flag_status, 'followed_up'::church.attendance_flag_status)
+     AND (p_member_ids IS NULL OR f.member_id = ANY(p_member_ids))
+     AND COALESCE((SELECT s.consecutive_misses FROM tmp_cef_streaks s WHERE s.member_id = f.member_id), 0) < v_threshold;
+
+  -- Lifecycle 2: reopen resolved flags back at/above threshold.
+  UPDATE church.attendance_flags f
+     SET status = 'open'::church.attendance_flag_status,
+         created_at = v_now,
+         notes = 'missed ' || s.consecutive_misses || ' consecutive events'
+    FROM tmp_cef_streaks s
+   WHERE f.church_id = p_church_id
+     AND f.flag_type = 'missed_consecutive_events'::church.attendance_flag_type
+     AND f.status = 'resolved'::church.attendance_flag_status
+     AND s.member_id = f.member_id
+     AND (p_member_ids IS NULL OR f.member_id = ANY(p_member_ids))
+     AND s.consecutive_misses >= v_threshold;
+
+  GET DIAGNOSTICS v_reopened = ROW_COUNT;
+
+  -- Lifecycle 3: refresh the live streak count on already-open flags.
+  UPDATE church.attendance_flags f
+     SET notes = 'missed ' || s.consecutive_misses || ' consecutive events'
+    FROM tmp_cef_streaks s
+   WHERE f.church_id = p_church_id
+     AND f.flag_type = 'missed_consecutive_events'::church.attendance_flag_type
+     AND f.status = 'open'::church.attendance_flag_status
+     AND s.member_id = f.member_id
+     AND (p_member_ids IS NULL OR f.member_id = ANY(p_member_ids))
+     AND s.consecutive_misses >= v_threshold;
+
+  -- Lifecycle 4: open new flags at/above threshold.
+  INSERT INTO church.attendance_flags (id, church_id, member_id, flag_type, status, notes, created_at)
+  SELECT
+    gen_random_uuid(),
+    p_church_id,
+    s.member_id,
+    'missed_consecutive_events'::church.attendance_flag_type,
+    'open'::church.attendance_flag_status,
+    'missed ' || s.consecutive_misses || ' consecutive events',
+    v_now
+  FROM tmp_cef_streaks s
+  WHERE s.consecutive_misses >= v_threshold
+    AND NOT EXISTS (
+      SELECT 1
+      FROM church.attendance_flags f
+      WHERE f.church_id = p_church_id
+        AND f.member_id = s.member_id
+        AND f.flag_type = 'missed_consecutive_events'::church.attendance_flag_type
+    );
+
+  GET DIAGNOSTICS v_inserted = ROW_COUNT;
+
+  DROP TABLE IF EXISTS tmp_cef_streaks;
+
+  RETURN v_inserted + v_reopened;
+END;
+$func$;
+
+REVOKE EXECUTE ON FUNCTION church.refresh_consecutive_event_flags(uuid, uuid[]) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION church.refresh_consecutive_event_flags(uuid, uuid[]) TO authenticated, service_role;
+
+-- Events left open hide misses (streaks only count completed events), so
+-- events whose start time passed the grace period are auto-completed.
+CREATE OR REPLACE FUNCTION church.auto_complete_stale_events(
+  p_church_id  uuid DEFAULT NULL,     -- NULL = all tenants (cron path)
+  p_grace_hours integer DEFAULT 6
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = church, public, auth
+AS $func$
+DECLARE
+  v_count integer := 0;
+BEGIN
+  IF auth.uid() IS NOT NULL THEN
+    IF p_church_id IS NULL OR p_church_id IS DISTINCT FROM church.my_tenant_id() THEN
+      RAISE EXCEPTION 'Unauthorized: cross-tenant access denied';
+    END IF;
+  END IF;
+
+  UPDATE church.events e
+     SET status = 'completed'::church.event_status
+   WHERE e.status IN ('upcoming'::church.event_status, 'active'::church.event_status)
+     AND (p_church_id IS NULL OR e.church_id = p_church_id)
+     AND (e.event_date + e.start_time) < now() - make_interval(hours => GREATEST(p_grace_hours, 1));
+
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count;
+END;
+$func$;
+
+REVOKE EXECUTE ON FUNCTION church.auto_complete_stale_events(uuid, integer) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION church.auto_complete_stale_events(uuid, integer) TO authenticated, service_role;
+
 -- Enable pg_cron
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
--- Schedule daily refresh (at 2 AM)
-SELECT cron.schedule('refresh-inactive-30-days-daily','0 2 * * *','SELECT church.refresh_inactive_30_days();');
+-- Nightly schedules. The old jobs called these functions WITHOUT the required
+-- p_church_id and failed every night; these loop over every tenant.
+DO $do$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+    PERFORM cron.unschedule('refresh-inactive-30-days-daily');
+    PERFORM cron.unschedule('process-inactive-30-days-followups-daily');
+    PERFORM cron.unschedule('refresh-consecutive-event-flags-daily');
+    PERFORM cron.unschedule('auto-complete-stale-events-hourly');
 
--- Schedule daily follow-up processing (at 2:10 AM)
-SELECT cron.schedule('process-inactive-30-days-followups-daily','10 2 * * *','SELECT church.process_inactive_30_days_followups();');
+    PERFORM cron.schedule('refresh-inactive-30-days-daily','0 2 * * *',
+      $cmd$SELECT church.refresh_inactive_30_days(id) FROM church.churches$cmd$);
+    PERFORM cron.schedule('process-inactive-30-days-followups-daily','10 2 * * *',
+      $cmd$SELECT church.process_inactive_30_days_followups(id) FROM church.churches$cmd$);
+    PERFORM cron.schedule('refresh-consecutive-event-flags-daily','20 2 * * *',
+      $cmd$SELECT church.refresh_consecutive_event_flags(id) FROM church.churches$cmd$);
+    PERFORM cron.schedule('auto-complete-stale-events-hourly','55 * * * *',
+      $cmd$SELECT church.auto_complete_stale_events()$cmd$);
+  ELSE
+    RAISE NOTICE 'pg_cron not available; schedules skipped.';
+  END IF;
+END;
+$do$;
 
 -- 12. Visitors Table (H3 remediation)
 CREATE TABLE IF NOT EXISTS church.visitors (

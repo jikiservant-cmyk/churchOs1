@@ -20,7 +20,11 @@ export function InactivityRefreshButton({ churchId, churchSlug }: InactivityRefr
       if ('error' in result) {
         toast.error('Failed to run inactivity detection: ' + result.error);
       } else {
-        toast.success(`Inactivity detection complete. Created ${result.count} new flags.`);
+        const streakNote =
+          result.consecutiveCount != null
+            ? ` + ${result.consecutiveCount} consecutive-miss flag${result.consecutiveCount === 1 ? '' : 's'}`
+            : '';
+        toast.success(`Inactivity scan complete. ${result.count} inactive flag${result.count === 1 ? '' : 's'}${streakNote}.`);
       }
     } catch (error) {
       toast.error('An unexpected error occurred');

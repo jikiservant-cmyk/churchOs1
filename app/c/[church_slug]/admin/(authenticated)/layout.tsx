@@ -12,11 +12,7 @@ export default async function AdminLayout({
   params: Promise<{ church_slug: string }> 
 }) {
   const { church_slug } = await params;
-  const church = await getChurchBySlug(church_slug);
-
-  if (!church) {
-    notFound();
-  }
+  let church = await getChurchBySlug(church_slug);
 
   const supabase = await createClient();
   const { data: { user }, error: authError } = await supabase.auth.getUser();
@@ -35,6 +31,22 @@ export default async function AdminLayout({
   // Role and Tenant Check (fail closed if no tenant_id assigned)
   if (!profile || profile.role !== 'pastor' || !profile.tenant_id) {
     redirect(`/?error=Access Denied`);
+  }
+
+  // If church was not found by the slug in the URL, recover using the pastor's tenant_id
+  if (!church) {
+    const { data: pastorChurch } = await supabase
+      .schema('church')
+      .from('churches')
+      .select('*')
+      .eq('id', profile.tenant_id)
+      .maybeSingle();
+
+    if (pastorChurch?.slug) {
+      redirect(`/${pastorChurch.slug}/admin`);
+    } else {
+      notFound();
+    }
   }
 
   // Church Mismatch Check

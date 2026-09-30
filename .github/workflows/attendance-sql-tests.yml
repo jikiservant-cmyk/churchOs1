@@ -1,0 +1,60 @@
+name: attendance-sql-tests
+
+# Runs the attendance absence-flag engine (the REAL migration SQL) against a
+# scratch Postgres with the Mon/Tue fellowship fixtures. Keeps
+# lib/attendance-streaks.ts, the migrations, and the tests from drifting.
+# Mirrors of these scenarios: tests/attendance-streaks.test.ts (no DB needed).
+
+on:
+  push:
+    paths:
+      - 'migrations/**'
+      - 'supabase-schema.sql'
+      - 'tests/sql/**'
+      - 'lib/attendance-*'
+      - 'tests/attendance-streaks.test.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/attendance-sql-tests.yml'
+  pull_request:
+
+jobs:
+  sql-streak-tests:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: churchos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply migrations + run SQL assertions
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -p 5432 -U postgres -d churchos_test \
+            -v ON_ERROR_STOP=1 -f tests/sql/attendance_streaks.test.sql
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run the no-DB TypeScript mirror suite
+        run: npm test
