@@ -1,21 +1,28 @@
 import type {Metadata} from 'next';
-import { Outfit, Playfair_Display } from 'next/font/google';
+// Self-hosted brand fonts (Fontsource). Previously these came from
+// next/font/google, which fetches from fonts.googleapis.com at build time
+// and hard-fails the build in network-restricted environments (CI, Cloud
+// Build, sandboxes). Bundling them keeps builds hermetic and works offline.
+import '@fontsource/outfit/400.css';
+import '@fontsource/outfit/500.css';
+import '@fontsource/outfit/600.css';
+import '@fontsource/outfit/700.css';
+import '@fontsource/outfit/800.css';
+import '@fontsource/playfair-display/400.css';
+import '@fontsource/playfair-display/500.css';
+import '@fontsource/playfair-display/600.css';
+import '@fontsource/playfair-display/700.css';
+import '@fontsource/playfair-display/800.css';
 import './globals.css';
 import GlobalClientWrapper from "@/components/GlobalClientWrapper";
 
-const outfit = Outfit({
-  subsets: ['latin'],
-  variable: '--font-sans',
-});
-
-const playfair = Playfair_Display({
-  subsets: ['latin'],
-  variable: '--font-serif',
-});
-
 export const metadata: Metadata = {
-  title: 'pastorOs',
-  description: 'Management platform for pastors',
+  title: 'churchOs - Multi-tenant SaaS for churches with MoMo giving and admin dashboard.',
+  description: 'Multi-tenant SaaS for churches with MoMo giving and admin dashboard.',
+  openGraph: {
+    title: 'churchOs - Multi-tenant SaaS for churches with MoMo giving and admin dashboard.',
+    description: 'Multi-tenant SaaS for churches with MoMo giving and admin dashboard.',
+  },
 };
 
 export const viewport = {
@@ -26,7 +33,7 @@ export const viewport = {
 
 export default function RootLayout({children}: {children: React.ReactNode}) {
   return (
-    <html lang="en" className={`${outfit.variable} ${playfair.variable}`}>
+    <html lang="en">
       <body suppressHydrationWarning>
         <GlobalClientWrapper>
           {children}

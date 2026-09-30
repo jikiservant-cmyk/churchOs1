@@ -1,5 +1,14 @@
 @import "tailwindcss";
 
+/* Brand fonts, self-hosted via Fontsource (see app/layout.tsx).
+   Overrides Tailwind v4's default --font-sans/--font-serif theme values so
+   font-sans / font-serif utilities and var(--font-*) references resolve to
+   the bundled fonts, with safe system fallbacks. */
+:root {
+  --font-sans: 'Outfit', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-serif: 'Playfair Display', Georgia, 'Times New Roman', serif;
+}
+
 @keyframes float {
   0%, 100% { transform: translateY(0); }
   50% { transform: translateY(-6px); }

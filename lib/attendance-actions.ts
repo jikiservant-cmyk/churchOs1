@@ -5,6 +5,7 @@ import { tenantScopedAdmin } from '@/lib/supabase/tenant-scoped';
 import { revalidatePath } from 'next/cache';
 import { cookies } from 'next/headers';
 import { ChurchEvent, AttendanceLog, AttendanceFlag, AttendanceFlagStatus } from './attendance-types';
+import { membersExpectedAtEvent } from './attendance-streaks';
 import { SignJWT, jwtVerify } from 'jose';
 import { sendSingleSMS } from './sms-actions';
 
@@ -330,7 +331,38 @@ export async function updateEventStatus(eventId: string, status: 'upcoming' | 'a
       .eq('id', eventId);
 
     if (error) return { error: error.message };
-    
+
+    // Finalising an event is the exact moment a "missed N consecutive events"
+    // streak can cross the threshold, so refresh flags right away instead of
+    // waiting for the nightly job. Scoped to the members expected at THIS
+    // event — their streaks are the only ones this event can change, which
+    // keeps completion cheap in big tenants. Best-effort: a stale/failed
+    // refresh never blocks event completion.
+    if (status === 'completed') {
+      try {
+        const [{ data: churchCfg }, { data: eventRow }, { data: roster }] = await Promise.all([
+          scopedDb.church('churches').select('meeting_days').eq('id', churchId).maybeSingle(),
+          scopedDb.church('events').select('event_date').eq('id', eventId).single(),
+          scopedDb.church('members').select('id, status, expected_days').eq('status', 'active'),
+        ]);
+
+        let memberIds: string[] | null = null;
+        if (eventRow?.event_date && roster) {
+          memberIds = membersExpectedAtEvent({
+            members: roster as { id: string; status: string; expected_days: number[] | null }[],
+            eventDate: eventRow.event_date,
+            tenantMeetingDays: (churchCfg?.meeting_days as number[] | null) ?? null,
+          });
+        }
+
+        await scopedDb.admin
+          .schema('church')
+          .rpc('refresh_consecutive_event_flags', { p_church_id: churchId, p_member_ids: memberIds });
+      } catch (flagErr) {
+        console.error('[updateEventStatus] consecutive-event flag refresh failed (non-fatal):', flagErr);
+      }
+    }
+
     revalidatePath(`/${churchSlug}/admin/attendance`);
     revalidatePath(`/${churchSlug}/admin/attendance/${eventId}`);
     revalidatePath(`/${churchSlug}/usher/dashboard`);
@@ -601,9 +633,23 @@ export async function runInactivityDetection(churchId: string, churchSlug: strin
     .rpc('refresh_inactive_30_days', { p_church_id: churchId });
 
   if (error) return { error: error.message };
-  
+
+  // Also run the consecutive-event engine: the schedule-agnostic "missed N
+  // consecutive events" flags that work for fellowships meeting on any
+  // weekday(s). Kept separate so a legacy-30-day failure can't block it.
+  let consecutiveCount: number | null = null;
+  const { data: streakData, error: streakError } = await supabase
+    .schema('church')
+    .rpc('refresh_consecutive_event_flags', { p_church_id: churchId });
+
+  if (streakError) {
+    console.error('[runInactivityDetection] consecutive-event refresh failed:', streakError);
+  } else {
+    consecutiveCount = streakData;
+  }
+
   revalidatePath(`/${churchSlug}/admin/attendance`);
-  return { success: true, count: data };
+  return { success: true, count: data, consecutiveCount };
 }
 
 export async function getAttendanceFlags(churchId: string) {
@@ -686,13 +732,17 @@ export async function sendMissedYouMessages(churchId: string, churchSlug: string
       return { error: 'Access denied' };
     }
 
-    // Sync the 3 consecutive Sundays missed flags by calling the deployed edge function
+    // Refresh "missed N consecutive events" flags before choosing recipients.
+    // (This used to invoke a `sync_missed_3_sundays_flags` Edge Function that
+    // does not exist anywhere in this repo, so the old Sunday flags were
+    // silently never synced. The engine now lives in the database where cron,
+    // event completion, and this action all share it.)
     try {
-      await supabase.functions.invoke('sync_missed_3_sundays_flags', {
-        method: 'POST'
-      });
+      await supabase
+        .schema('church')
+        .rpc('refresh_consecutive_event_flags', { p_church_id: churchId });
     } catch (e) {
-      console.error('Failed to invoke edge function:', e);
+      console.error('Failed to refresh consecutive-event flags:', e);
     }
 
     const memberIdsToMessage = new Set<string>();
@@ -730,13 +780,14 @@ export async function sendMissedYouMessages(churchId: string, churchSlug: string
       }
     }
 
-    // Fetch members who have an active 'missed_3_sundays' flag
+    // Fetch members with an active consecutive-miss flag. Also accept legacy
+    // 'missed_3_sundays' flag rows created before the engine was replaced.
     const { data: openFlags, error: flagsError } = await supabase
       .schema('church')
       .from('attendance_flags')
       .select('id, member_id')
       .eq('church_id', churchId)
-      .eq('flag_type', 'missed_3_sundays')
+      .in('flag_type', ['missed_consecutive_events', 'missed_3_sundays'])
       .eq('status', 'open');
 
     if (flagsError) return { error: flagsError.message };
