@@ -638,7 +638,7 @@ CREATE TABLE IF NOT EXISTS church.members (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   full_name text NOT NULL,
-  code text UNIQUE,
+  code text,
   phone_number text,
   email text,
   gender text,
@@ -671,7 +671,7 @@ CREATE TABLE IF NOT EXISTS church.new_converts (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   name text NOT NULL,
-  code text UNIQUE,
+  code text,
   contact text,
   follow_up_status text DEFAULT 'pending',
   notes text,
@@ -685,7 +685,7 @@ CREATE TABLE IF NOT EXISTS church.events (
   church_id uuid NOT NULL REFERENCES church.churches(id) ON DELETE CASCADE,
 
   name text NOT NULL,
-  code text UNIQUE,
+  code text,
   service_type church.event_service_type NOT NULL,
   event_date date NOT NULL DEFAULT CURRENT_DATE,
   start_time time DEFAULT '09:00:00',
@@ -739,7 +739,7 @@ CREATE TABLE IF NOT EXISTS church.prayers (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   submitter_name text NOT NULL,
-  code text UNIQUE,
+  code text,
   body text NOT NULL,
   status text DEFAULT 'open',
   created_at timestamptz DEFAULT now()
@@ -749,7 +749,7 @@ CREATE TABLE IF NOT EXISTS church.small_groups (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   church_id uuid REFERENCES church.churches(id) ON DELETE CASCADE NOT NULL,
   name text NOT NULL,
-  code text UNIQUE,
+  code text,
   leader_name text NOT NULL,
   meeting_day text NOT NULL,
   member_count int DEFAULT 0,
@@ -763,6 +763,23 @@ CREATE TABLE IF NOT EXISTS church.donations (
   amount_cents bigint NOT NULL,
   created_at timestamptz DEFAULT now()
 );
+
+-- Tenant-scoped code uniqueness (migration 007): codes are per-church,
+-- not globally unique; NULL codes are excluded via partial index.
+CREATE UNIQUE INDEX IF NOT EXISTS members_church_code_uniq
+  ON church.members (church_id, code) WHERE code IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS new_converts_church_code_uniq
+  ON church.new_converts (church_id, code) WHERE code IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS events_church_code_uniq
+  ON church.events (church_id, code) WHERE code IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS prayers_church_code_uniq
+  ON church.prayers (church_id, code) WHERE code IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS small_groups_church_code_uniq
+  ON church.small_groups (church_id, code) WHERE code IS NOT NULL;
 
 -- Initial demo data for Grace Church (MT-01: rotated static passkey to dynamic 6-digit CSPRNG)
 INSERT INTO church.churches (id, name, slug, passkey, theme_color, logo_url)
