@@ -13,6 +13,8 @@ on:
       - 'tests/sql/**'
       - 'lib/attendance-*'
       - 'tests/attendance-streaks.test.ts'
+      - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/attendance-sql-tests.yml'
   pull_request:
 
@@ -44,6 +46,15 @@ jobs:
         run: |
           psql -h localhost -p 5432 -U postgres -d churchos_test \
             -v ON_ERROR_STOP=1 -f tests/sql/attendance_streaks.test.sql
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
 
       - name: Run the no-DB TypeScript mirror suite
         run: npm test
